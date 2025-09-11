@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from transformers.models.auto import AutoModel, AutoModelForCausalLM
+from transformers import BitsAndBytesConfig
 
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import CausalLMOutput, BaseModelOutputWithPast, ModelOutput
@@ -421,7 +422,7 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
             
             timesteps = torch.multinomial(
                 torch.ones(self.config.diffusion_head_config.ddpm_num_steps),
-                speech_len * ddpm_batch_mul,
+                speech_len * ddmp_batch_mul,
                 replacement=True,
             ).to(hidden_states.device)
 

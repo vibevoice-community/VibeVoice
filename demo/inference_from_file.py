@@ -8,6 +8,8 @@ import torch
 
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
+from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
+from transformers import BitsAndBytesConfig
 from transformers.utils import logging
 
 logging.set_verbosity_info()
@@ -176,6 +178,13 @@ def parse_args():
         default=1.3,
         help="CFG (Classifier-Free Guidance) scale for generation (default: 1.3)",
     )
+    parser.add_argument(
+        "--quantize_llm",
+        type=str,
+        choices=["none", "4bit", "8bit"],
+        default="none",
+        help="Quantize language model: none (default), 4bit, 8bit"
+    )
     
     return parser.parse_args()
 
@@ -193,6 +202,7 @@ def main():
         args.device = "cpu"
 
     print(f"Using device: {args.device}")
+    print(f"LLM quantization: {args.quantize_llm}")
 
     # Initialize voice mapper
     voice_mapper = VoiceMapper()
@@ -251,11 +261,13 @@ def main():
     
     # Prepare data for model
     full_script = '\n'.join(scripts)
-    full_script = full_script.replace("’", "'")        
+    full_script = full_script.replace("'", "'")        
     
     print(f"Loading processor & model from {args.model_path}")
     processor = VibeVoiceProcessor.from_pretrained(args.model_path)
 
+    # Load config
+    config = VibeVoiceConfig.from_pretrained(args.model_path)
 
     # Decide dtype & attention implementation
     if args.device == "mps":
@@ -263,51 +275,68 @@ def main():
         attn_impl_primary = "sdpa"  # flash_attention_2 not supported on MPS
     elif args.device == "cuda":
         load_dtype = torch.bfloat16
-        attn_impl_primary = "flash_attention_2"
+        attn_impl_primary = "sdpa"  # Use SDPA instead of flash_attention_2 for stability
     else:  # cpu
         load_dtype = torch.float32
         attn_impl_primary = "sdpa"
+
+    quantization_config = None
+    if args.quantize_llm == '4bit':
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=load_dtype, 
+            bnb_4bit_use_double_quant=True,
+        )
+        print(f"Using 4-bit quantization (NF4) for language model")
+    elif args.quantize_llm == '8bit':
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_threshold=6.0,
+            llm_int8_skip_modules=["lm_head", "embed_tokens"],  # leaving out specific layers
+        )
+        print(f"Using 8-bit quantization for language model")
+    else:
+        print(f"Loading language model without quantization")
+
     print(f"Using device: {args.device}, torch_dtype: {load_dtype}, attn_implementation: {attn_impl_primary}")
-    # Load model with device-specific logic
+    
+    # Load model with device-specific logic and quantization
     try:
+        model_kwargs = {
+            "config": config,
+            "torch_dtype": load_dtype,
+            "attn_implementation": attn_impl_primary,
+        }
+        
+        # Add quantization config if specified
+        if quantization_config is not None:
+            model_kwargs["quantization_config"] = quantization_config
+        
         if args.device == "mps":
             model = VibeVoiceForConditionalGenerationInference.from_pretrained(
                 args.model_path,
-                torch_dtype=load_dtype,
-                attn_implementation=attn_impl_primary,
                 device_map=None,  # load then move
+                **model_kwargs
             )
             model.to("mps")
         elif args.device == "cuda":
             model = VibeVoiceForConditionalGenerationInference.from_pretrained(
                 args.model_path,
-                torch_dtype=load_dtype,
                 device_map="cuda",
-                attn_implementation=attn_impl_primary,
+                **model_kwargs
             )
         else:  # cpu
             model = VibeVoiceForConditionalGenerationInference.from_pretrained(
                 args.model_path,
-                torch_dtype=load_dtype,
                 device_map="cpu",
-                attn_implementation=attn_impl_primary,
+                **model_kwargs
             )
     except Exception as e:
-        if attn_impl_primary == 'flash_attention_2':
-            print(f"[ERROR] : {type(e).__name__}: {e}")
-            print(traceback.format_exc())
-            print("Error loading the model. Trying to use SDPA. However, note that only flash_attention_2 has been fully tested, and using SDPA may result in lower audio quality.")
-            model = VibeVoiceForConditionalGenerationInference.from_pretrained(
-                args.model_path,
-                torch_dtype=load_dtype,
-                device_map=(args.device if args.device in ("cuda", "cpu") else None),
-                attn_implementation='sdpa'
-            )
-            if args.device == "mps":
-                model.to("mps")
-        else:
-            raise e
-
+        print(f"[ERROR] : {type(e).__name__}: {e}")
+        print(traceback.format_exc())
+        print("Error loading the model. Please check your configuration and dependencies.")
+        return
 
     model.eval()
     model.set_ddpm_inference_steps(num_steps=10)
@@ -385,14 +414,16 @@ def main():
     print(f"Input file: {args.txt_path}")
     print(f"Output file: {output_path}")
     print(f"Speaker names: {args.speaker_names}")
+    print(f"LLM quantization: {args.quantize_llm}")
     print(f"Number of unique speakers: {len(set(speaker_numbers))}")
     print(f"Number of segments: {len(scripts)}")
     print(f"Prefilling tokens: {input_tokens}")
     print(f"Generated tokens: {generated_tokens}")
     print(f"Total tokens: {output_tokens}")
     print(f"Generation time: {generation_time:.2f} seconds")
-    print(f"Audio duration: {audio_duration:.2f} seconds")
-    print(f"RTF (Real Time Factor): {rtf:.2f}x")
+    if outputs.speech_outputs and outputs.speech_outputs[0] is not None:
+        print(f"Audio duration: {audio_duration:.2f} seconds")
+        print(f"RTF (Real Time Factor): {rtf:.2f}x")
     
     print("="*50)
 
