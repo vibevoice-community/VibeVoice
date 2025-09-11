@@ -181,11 +181,43 @@ def parse_args():
     parser.add_argument(
         "--quantize_llm",
         type=str,
-        choices=["none", "4bit", "8bit", "gptq"],  # GPTQ HOZZÁADVA
+        choices=["none", "4bit", "8bit", "gptq"],  # Add "gptq" here too
         default="none",
         help="Quantize language model: none (default), 4bit, 8bit, gptq"
     )
     
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.95,
+        help="Sampling temperature (default: 0.95)"
+    )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=0.95,
+        help="Top-p (nucleus) sampling (default: 0.95)"
+    )
+    parser.add_argument(
+        "--top_k",
+        type=int,
+        default=0,
+        help="Top-k sampling, 0 = disabled (default: 0)"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility (default: 42)"
+    )
+
+    parser.add_argument(
+        "--do_sample",
+        action="store_true",
+        default=True,  # Default True, hogy a sampling alapértelmezett legyen
+        help="Enable sampling (default: True)"
+    )
+        
     return parser.parse_args()
 
 def main():
@@ -203,6 +235,13 @@ def main():
 
     print(f"Using device: {args.device}")
     print(f"LLM quantization: {args.quantize_llm}")
+    print(f"Generation settings: temp={args.temperature}, top_p={args.top_p}, top_k={args.top_k}, seed={args.seed}")
+
+    # Set random seed for reproducibility
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
 
     # Initialize voice mapper
     voice_mapper = VoiceMapper()
@@ -272,7 +311,18 @@ def main():
     # Pass quantization info to config for GPTQ handling
     config.quantize_llm = args.quantize_llm
 
+    # Decide dtype & attention implementation
+    if args.device == "mps":
+        load_dtype = torch.float32  # MPS requires float32
+        attn_impl_primary = "sdpa"  # flash_attention_2 not supported on MPS
+    elif args.device == "cuda":
+        load_dtype = torch.bfloat16
+        attn_impl_primary = "sdpa"  # Use SDPA instead of flash_attention_2 for stability
+    else:  # cpu
+        load_dtype = torch.float32
+        attn_impl_primary = "sdpa"
     # Setup quantization if requested
+
     quantization_config = None
     if args.quantize_llm == '4bit':
         quantization_config = BitsAndBytesConfig(
@@ -292,17 +342,6 @@ def main():
     else:
         print(f"Loading language model without quantization")
 
-    # Decide dtype & attention implementation
-    if args.device == "mps":
-        load_dtype = torch.float32  # MPS requires float32
-        attn_impl_primary = "sdpa"  # flash_attention_2 not supported on MPS
-    elif args.device == "cuda":
-        load_dtype = torch.bfloat16
-        attn_impl_primary = "sdpa"  # Use SDPA instead of flash_attention_2 for stability
-    else:  # cpu
-        load_dtype = torch.float32
-        attn_impl_primary = "sdpa"
-        
     print(f"Using device: {args.device}, torch_dtype: {load_dtype}, attn_implementation: {attn_impl_primary}")
     
     # Load model with device-specific logic and quantization
@@ -372,7 +411,12 @@ def main():
         max_new_tokens=None,
         cfg_scale=args.cfg_scale,
         tokenizer=processor.tokenizer,
-        generation_config={'do_sample': False},
+        generation_config={
+            'do_sample': args.do_sample,  # Enable sampling by default
+            'temperature': args.temperature,
+            'top_p': args.top_p,
+            'top_k': args.top_k if args.top_k > 0 else None,  # None if 0
+        },
         verbose=True,
     )
     generation_time = time.time() - start_time

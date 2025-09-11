@@ -130,14 +130,16 @@ class VibeVoiceModel(VibeVoicePreTrainedModel):
                 # Use pre-quantized GPTQ model that matches VibeVoice-Large (7B)
                 gptq_model_path = "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4"
                 
+                # Try with optimum's GPTQ support first
                 self.language_model = AutoModelForCausalLM.from_pretrained(
                     gptq_model_path,
                     torch_dtype="auto",
-                    device_map="cuda"
+                    device_map="cuda",
+                    trust_remote_code=True
                 )
-                print(f"Successfully loaded GPTQ model from {gptq_model_path}")
+                print(f"Successfully loaded GPTQ model with optimum from {gptq_model_path}")
             except Exception as e:
-                print(f"Failed to load GPTQ model: {e}")
+                print(f"Failed to load GPTQ model with optimum: {e}")
                 print("Falling back to standard model...")
                 self.language_model = AutoModel.from_config(lm_config)
         else:

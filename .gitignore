@@ -175,3 +175,4 @@ tags
 /checkpoints/
 exp
 .gradio/
+demo/text_examples/dev
