@@ -181,9 +181,9 @@ def parse_args():
     parser.add_argument(
         "--quantize_llm",
         type=str,
-        choices=["none", "4bit", "8bit"],
+        choices=["none", "4bit", "8bit", "gptq"],  # GPTQ HOZZÁADVA
         default="none",
-        help="Quantize language model: none (default), 4bit, 8bit"
+        help="Quantize language model: none (default), 4bit, 8bit, gptq"
     )
     
     return parser.parse_args()
@@ -268,6 +268,29 @@ def main():
 
     # Load config
     config = VibeVoiceConfig.from_pretrained(args.model_path)
+    
+    # Pass quantization info to config for GPTQ handling
+    config.quantize_llm = args.quantize_llm
+
+    # Setup quantization if requested
+    quantization_config = None
+    if args.quantize_llm == '4bit':
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=load_dtype,
+            bnb_4bit_use_double_quant=True,
+        )
+        print(f"Using 4-bit quantization (NF4) for language model")
+    elif args.quantize_llm == '8bit':
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_threshold=6.0,  # Magasabb threshold a jobb minőségért
+            llm_int8_skip_modules=["lm_head", "embed_tokens"],  # Kritikus rétegek kihagyása
+        )
+        print(f"Using selective 8-bit quantization (skip embeddings & lm_head)")
+    else:
+        print(f"Loading language model without quantization")
 
     # Decide dtype & attention implementation
     if args.device == "mps":
@@ -279,26 +302,7 @@ def main():
     else:  # cpu
         load_dtype = torch.float32
         attn_impl_primary = "sdpa"
-
-    quantization_config = None
-    if args.quantize_llm == '4bit':
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=load_dtype, 
-            bnb_4bit_use_double_quant=True,
-        )
-        print(f"Using 4-bit quantization (NF4) for language model")
-    elif args.quantize_llm == '8bit':
-        quantization_config = BitsAndBytesConfig(
-            load_in_8bit=True,
-            llm_int8_threshold=6.0,
-            llm_int8_skip_modules=["lm_head", "embed_tokens"],  # leaving out specific layers
-        )
-        print(f"Using 8-bit quantization for language model")
-    else:
-        print(f"Loading language model without quantization")
-
+        
     print(f"Using device: {args.device}, torch_dtype: {load_dtype}, attn_implementation: {attn_impl_primary}")
     
     # Load model with device-specific logic and quantization

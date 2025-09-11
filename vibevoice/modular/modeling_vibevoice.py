@@ -117,9 +117,32 @@ class VibeVoiceModel(VibeVoicePreTrainedModel):
         else:
             dtype = torch.float32
         
-        # Initialize Qwen2 model for language modeling
-        lm_config = config.decoder_config 
-        self.language_model = AutoModel.from_config(lm_config)
+        # Initialize Qwen2 model for language modeling with optional GPTQ support
+        lm_config = config.decoder_config
+        
+        # Handle GPTQ quantization
+        quantize_llm = getattr(config, 'quantize_llm', 'none')
+        
+        if quantize_llm == 'gptq':
+            try:
+                print("Loading GPTQ pre-quantized Qwen2.5 model...")
+                
+                # Use pre-quantized GPTQ model that matches VibeVoice-Large (7B)
+                gptq_model_path = "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4"
+                
+                self.language_model = AutoModelForCausalLM.from_pretrained(
+                    gptq_model_path,
+                    torch_dtype="auto",
+                    device_map="cuda"
+                )
+                print(f"Successfully loaded GPTQ model from {gptq_model_path}")
+            except Exception as e:
+                print(f"Failed to load GPTQ model: {e}")
+                print("Falling back to standard model...")
+                self.language_model = AutoModel.from_config(lm_config)
+        else:
+            # Standard loading
+            self.language_model = AutoModel.from_config(lm_config)
         
         # Initialize speech components if needed
         self.acoustic_tokenizer = AutoModel.from_config(config.acoustic_tokenizer_config).to(dtype)

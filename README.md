@@ -1,5 +1,10 @@
-> [!IMPORTANT]
-> This is a community-maintained fork of VibeVoice. Following the removal of the official VibeVoice repository, this fork serves to preserve the codebase and maintain accessibility for the community while also introducing additional functionality (such as unofficial training/fine-tuning implementations)
+## Modified features:
+- added 4bit bnb quantization option to the inference file (added option to 8bit too but it doesn't work so don't use it)
+
+**Usage:**
+```
+python inference_from_file.py --model_path aoi-ot/VibeVoice-Large --txt_path text_examples/yourtextfile.txt --quantize_llm 8bit --speaker_names your_speaker
+```
 
 ## 🎙️ VibeVoice: A Frontier Long Conversational Text-to-Speech Model
 
