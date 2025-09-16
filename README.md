@@ -1,3 +1,4 @@
+**IMPORTANT:** I only modifed the demo/inference_from_file.py code. Please note that these newfunctions won't work with other inference examples like gradio or ipynb.
 ## Modified features:
 - added 4bit bnb quantization option to the inference file
 - added lora support (**IMPORTANT: it doesn't work with 4bit quantization**)
