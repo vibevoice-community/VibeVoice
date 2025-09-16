@@ -1,9 +1,15 @@
 ## Modified features:
-- added 4bit bnb quantization option to the inference file (added option to 8bit too but it doesn't work so don't use it)
+- added 4bit bnb quantization option to the inference file
+- added lora support (**IMPORTANT: it doesn't work with 4bit quantization**)
 
-**Usage:**
+**Basic Usage:**
 ```
-python inference_from_file.py --model_path aoi-ot/VibeVoice-Large --txt_path text_examples/yourtextfile.txt --quantize_llm 8bit --speaker_names your_speaker
+python inference_from_file.py --model_path aoi-ot/VibeVoice-Large --txt_path text_examples/yourtextfile.txt --quantize_llm 4bit --speaker_names your_speaker
+```
+
+**Lora Usage:**
+```
+python inference_from_file.py --model_path aoi-ot/VibeVoice-Large --txt_path text_examples/yourtextfile.txt --lora_path /path/to/your/lora --use_diffusion_head_lora --seed random --output output/output.wav
 ```
 
 ## 🎙️ VibeVoice: A Frontier Long Conversational Text-to-Speech Model
