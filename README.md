@@ -92,6 +92,8 @@ python demo/inference_from_file.py --model_path vibevoice/VibeVoice-Large --txt_
 
 ## [Finetuning](./FINETUNING.md)
 
+NOTE: Finetuning is still **very experimental** and not well tested yet!
+
 ## FAQ
 
 #### Q1: Is this a pretrained model?

@@ -1,5 +1,8 @@
 # Finetuning
 
+> [!IMPORTANT]
+> Finetuning is still **very experimental** and not well tested yet!
+
 More instructions coming soon.
 
 Join the [Discord](https://discord.gg/ZDEYTTRxWG) for support.
