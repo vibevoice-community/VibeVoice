@@ -89,6 +89,9 @@ python demo/inference_from_file.py --model_path vibevoice/VibeVoice-Large --txt_
 python demo/inference_from_file.py --model_path vibevoice/VibeVoice-Large --txt_path demo/text_examples/2p_music.txt --speaker_names Alice Frank
 ```
 
+
+## [Finetuning](./FINETUNING.md)
+
 ## FAQ
 
 #### Q1: Is this a pretrained model?
