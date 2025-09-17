@@ -426,6 +426,14 @@ class VibeVoiceProcessor:
             if isinstance(speaker_audio, str):
                 # Load audio from file
                 wav = self.audio_processor._load_audio_from_path(speaker_audio)
+            elif isinstance(speaker_audio, dict):
+                # Handle dict format with 'array' or 'audio' key
+                if 'array' in speaker_audio:
+                    wav = np.array(speaker_audio['array'], dtype=np.float32)
+                elif 'audio' in speaker_audio:
+                    wav = np.array(speaker_audio['audio'], dtype=np.float32)
+                else:
+                    raise ValueError(f"Dictionary audio input must have 'array' or 'audio' key, got: {speaker_audio.keys()}")
             else:
                 wav = np.array(speaker_audio, dtype=np.float32)
             
