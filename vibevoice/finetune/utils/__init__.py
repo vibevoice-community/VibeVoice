@@ -6,7 +6,7 @@ from .arguments import (DataArguments, ModelArguments,
                         VibeVoiceTrainingArguments)
 from .callbacks import create_callbacks
 from .data_utils import setup_data_pipeline
-from .ema_callback import EmaCallback
+from .callbacks import EmaCallback
 from .lora_config import (apply_diffusion_head_lora, apply_lm_lora,
                           enable_lm_lora_parameters, freeze_all_parameters)
 from .model_introspection import (ModelComponents,
