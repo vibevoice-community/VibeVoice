@@ -13,7 +13,29 @@ python inference_from_file.py --model_path aoi-ot/VibeVoice-Large --txt_path tex
 python inference_from_file.py --model_path aoi-ot/VibeVoice-Large --txt_path text_examples/yourtextfile.txt --lora_path /path/to/your/lora --use_diffusion_head_lora --seed random --output output/output.wav
 ```
 
-## 🎙️ VibeVoice: A Frontier Long Conversational Text-to-Speech Model
+## Installation
+### Clone the repo
+```
+git clone https://github.com/cseti007/VibeVoice
+cd VibeVoice
+```
+### Create virtual environment
+```
+python -m venv venv
+
+# Activate virtual environment
+#On Linux/Mac:
+source venv/bin/activate
+#On Windows:
+venv\Scripts\activate
+```
+### Install VibeVoice
+```
+# From the VibeVoice directory
+pip install -e .
+```
+
+
 
 [![Project Page](https://img.shields.io/badge/Project-Page-blue)](https://microsoft.github.io/VibeVoice)
 [![Hugging Face](https://img.shields.io/badge/Hugging_Face-Models-orange?logo=huggingface)](https://huggingface.co/vibevoice)

@@ -31,7 +31,9 @@ dependencies = [
     "absl-py",
     "gradio",
     "av",
-    "aiortc"
+    "aiortc",
+    "safetensors",
+    "peft", 
 ]
 
 
