@@ -8,7 +8,11 @@
 [![Technical Report](https://img.shields.io/badge/Technical-Report-red)](https://arxiv.org/pdf/2508.19205)
 [![Colab](https://img.shields.io/badge/Colab-Demo-orange?logo=googlecolab)](https://colab.research.google.com/github/vibevoice-community/VibeVoice/blob/main/demo/VibeVoice_colab.ipynb)
 
-https://discord.gg/ZDEYTTRxWG
+## Community
+
+**Join the unofficial Discord community: https://discord.gg/ZDEYTTRxWG** - share samples, ask questions, discuss fine-tuning, etc.
+
+## Overview
 
 VibeVoice is a novel framework designed for generating **expressive**, **long-form**, **multi-speaker** conversational audio, such as podcasts, from text. It addresses significant challenges in traditional Text-to-Speech (TTS) systems, particularly in scalability, speaker consistency, and natural turn-taking.
 
@@ -16,7 +20,9 @@ A core innovation of VibeVoice is its use of continuous speech tokenizers (Acous
 
 The model can synthesize speech up to **90 minutes** long with up to **4 distinct speakers**, surpassing the typical 1-2 speaker limits of many prior models.
 
-[Examples](./EXAMPLES.md)
+## [Examples](./EXAMPLES.md)
+
+## Evaluation
 
 <p align="left">
   <img src="Figures/MOS-preference.png" alt="MOS Preference Results" height="260px">
@@ -24,83 +30,67 @@ The model can synthesize speech up to **90 minutes** long with up to **4 distinc
 </p>
 
 
-### Updates
+## Updates
 
-- **[2025-09-06]** Unofficial training/fine-tuning code coming soon!
 - **[2025-09-05]** Microsoft repo restored (without code) with statement about responsible AI use.
 - **[2025-09-04]** Community backup created after Microsoft removed original repo and models.
 - **[2025-08-26]** The [VibeVoice-7B](https://huggingface.co/vibevoice/VibeVoice-7B) model weights are open-sourced!
 - **[2025-08-28]** [Colab Notebook](https://colab.research.google.com/github/microsoft-community/VibeVoice/blob/main/demo/VibeVoice_colab.ipynb) available. Only VibeVoice-1.5B is supported due to GPU memory limitations.
 
-### Roadmap
+## Roadmap
 
 - [ ] Unofficial/community training code
 - [ ] HF Transformers integration ([PR](https://github.com/huggingface/transformers/pull/40546))
 - [ ] VibePod: End-to-end solution that creates podcasts from documents, webpages, or even a simple topic.
 
+## Model Zoo
 
-## Models
 | Model | Context Length | Generation Length |  Weight |
 |-------|----------------|----------|----------|
-| VibeVoice-0.5B-Streaming | - | - | On the way |
 | VibeVoice-1.5B | 64K | ~90 min | [HF link](https://huggingface.co/vibevoice/VibeVoice-1.5B) |
 | VibeVoice-Large| 32K | ~45 min | [HF link](https://huggingface.co/vibevoice/VibeVoice-7B) |
 
 ## Installation
-We recommend to use NVIDIA Deep Learning Container to manage the CUDA environment. 
 
-1. Launch docker
-```bash
-# NVIDIA PyTorch Container 24.07 / 24.10 / 24.12 verified. 
-# Later versions are also compatible.
-sudo docker run --privileged --net=host --ipc=host --ulimit memlock=-1:-1 --ulimit stack=-1:-1 --gpus all --rm -it nvcr.io/nvidia/pytorch:24.07-py3
-
-## If flash attention is not included in your docker environment, you need to install it manually
-## Refer to https://github.com/Dao-AILab/flash-attention for installation instructions
-# pip install flash-attn --no-build-isolation
-```
-
-2. Install from github
 ```bash
 git clone https://github.com/vibevoice-community/VibeVoice.git
 cd VibeVoice/
 
-pip install -e .
+uv pip install -e .
 ```
 
-## Usages
+## Usage
 
 ### 🚨 Tips
+
 We observed users may encounter occasional instability when synthesizing Chinese speech. We recommend:
 
 - Using English punctuation even for Chinese text, preferably only commas and periods.
 - Using the Large model variant, which is considerably more stable.
 - If you found the generated voice speak too fast. Please try to chunk your text with multiple speaker turns with same speaker label.
 
-We'd like to thank [PsiPi](https://huggingface.co/PsiPi) for sharing an interesting way for emotion control. Detials can be found via [discussion12](https://huggingface.co/microsoft/VibeVoice-1.5B/discussions/12).
+We'd like to thank [PsiPi](https://huggingface.co/PsiPi) for sharing an interesting way for emotion control. Details can be found via [discussion #12](https://huggingface.co/microsoft/VibeVoice-1.5B/discussions/12).
 
-### Usage 1: Launch Gradio demo
+**Option 1: Launch Gradio demo**
+
 ```bash
-apt update && apt install ffmpeg -y # for demo
-
-# For 1.5B model
-python demo/gradio_demo.py --model_path microsoft/VibeVoice-1.5B --share
-
-# For Large model
-python demo/gradio_demo.py --model_path microsoft/VibeVoice-Large --share
+python demo/gradio_demo.py --model_path vibevoice/VibeVoice-1.5B --share
+# or python demo/gradio_demo.py --model_path vibevoice/VibeVoice-Large --share
 ```
 
-### Usage 2: Inference from files directly
+**Option 2: Inference from files directly**
+
 ```bash
 # We provide some LLM generated example scripts under demo/text_examples/ for demo
 # 1 speaker
-python demo/inference_from_file.py --model_path microsoft/VibeVoice-Large --txt_path demo/text_examples/1p_abs.txt --speaker_names Alice
+python demo/inference_from_file.py --model_path vibevoice/VibeVoice-Large --txt_path demo/text_examples/1p_abs.txt --speaker_names Alice
 
 # or more speakers
-python demo/inference_from_file.py --model_path microsoft/VibeVoice-Large --txt_path demo/text_examples/2p_music.txt --speaker_names Alice Frank
+python demo/inference_from_file.py --model_path vibevoice/VibeVoice-Large --txt_path demo/text_examples/2p_music.txt --speaker_names Alice Frank
 ```
 
 ## FAQ
+
 #### Q1: Is this a pretrained model?
 **A:** Yes, it's a pretrained model without any post-training or benchmark-specific optimizations. In a way, this makes VibeVoice very versatile and fun to use.
 
@@ -127,15 +117,14 @@ In fact, we intentionally decided not to denoise our training data because we th
 #### Q6: Instability of cross-lingual transfer.
 **A:** The model does exhibit strong cross-lingual transfer capabilities, including the preservation of accents, but its performance can be unstable. This is an emergent ability of the model that we have not specifically optimized. It's possible that a satisfactory result can be achieved through repeated sampling.
 
-## Risks and limitations
+## Credits
 
-While efforts have been made to optimize it through various techniques, it may still produce outputs that are unexpected, biased, or inaccurate. VibeVoice inherits any biases, errors, or omissions produced by its base model (specifically, Qwen2.5 1.5b in this release).
-Potential for Deepfakes and Disinformation: High-quality synthetic speech can be misused to create convincing fake audio content for impersonation, fraud, or spreading disinformation. Users must ensure transcripts are reliable, check content accuracy, and avoid using generated content in misleading ways. Users are expected to use the generated content and to deploy the models in a lawful manner, in full compliance with all applicable laws and regulations in the relevant jurisdictions. It is best practice to disclose the use of AI when sharing AI-generated content.
+- Thanks to [Microsoft](https://github.com/microsoft/VibeVoice) for the original VibeVoice implementation.
+- Huge shoutout to [Juan Pablo Gallego](https://github.com/jpgallegoar) from [VoicePowered AI](https://www.voicepowered.ai/) for the unofficial training/fine-tuning code.
+- Thanks to [PsiPi](https://huggingface.co/PsiPi) for sharing an interesting way for emotion control. Details can be found via [discussion #12](https://huggingface.co/microsoft/VibeVoice-1.5B/discussions/12).
 
-English and Chinese only: Transcripts in languages other than English or Chinese may result in unexpected audio outputs.
+## License
 
-Non-Speech Audio: The model focuses solely on speech synthesis and does not handle background noise, music, or other sound effects.
+The source code and models are licensed under the MIT License. See the [LICENSE](./LICENSE) file for details.
 
-Overlapping Speech: The current model does not explicitly model or generate overlapping speech segments in conversations.
-
-We do not recommend using VibeVoice in commercial or real-world applications without further testing and development. This model is intended for research and development purposes only. Please use responsibly.
+Note: Microsoft has removed the original repo and models. This fork is based off of the MIT-licensed code from Microsoft.
