@@ -23,7 +23,7 @@ from vibevoice.modular.modeling_vibevoice import VibeVoiceForConditionalGenerati
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 
-from data_vibevoice import VibeVoiceDataset, VibeVoiceCollator
+from vibevoice.finetune.data_vibevoice import VibeVoiceDataset, VibeVoiceCollator
 
 logger = logging.getLogger(__name__)
 
