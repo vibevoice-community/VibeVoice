@@ -1,11 +1,14 @@
-from transformers import TrainerCallback
-import torch
 import copy
+
+import torch
+from transformers import TrainerCallback
+
 
 class EmaCallback(TrainerCallback):
     """
     EMA callback for VibeVoice finetuning.
     """
+
     def __init__(self, attr_path="model.prediction_head", decay=0.999, device="cpu"):
         """
         attr_path: where the head lives under self.model (Trainer wraps your VibeVoiceForConditionalGeneration)

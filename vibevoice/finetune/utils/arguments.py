@@ -7,7 +7,8 @@ from transformers import TrainingArguments as HfTrainingArguments
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(
-        default="vibevoice/VibeVoice-1.5B", metadata={"help": "Path to VibeVoice base model with config.json"}
+        default="vibevoice/VibeVoice-1.5B",
+        metadata={"help": "Path to VibeVoice base model with config.json"},
     )
     processor_name_or_path: Optional[str] = field(
         default=None,
@@ -44,7 +45,6 @@ class ModelArguments:
             "help": "Comma-separated indices of diffusion head layers to freeze (e.g., '0,1,5,7,8')."
         },
     )
-
 
 
 @dataclass
