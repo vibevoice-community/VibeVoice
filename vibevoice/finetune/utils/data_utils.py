@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from datasets import VerificationMode, load_dataset
 
-from data_vibevoice import VibeVoiceCollator, VibeVoiceDataset
+from vibevoice.finetune.data_vibevoice import VibeVoiceCollator, VibeVoiceDataset
 
 logger = logging.getLogger(__name__)
 

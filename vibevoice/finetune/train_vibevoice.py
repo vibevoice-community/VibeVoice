@@ -11,26 +11,26 @@ import torch
 from transformers import HfArgumentParser, set_seed
 
 # Import modular components
-from utils.arguments import (DataArguments, ModelArguments,
+from vibevoice.finetune.utils.arguments import (DataArguments, ModelArguments,
                              VibeVoiceTrainingArguments)
-from utils.callbacks import create_callbacks
-from utils.data_utils import setup_data_pipeline
-from utils.lora_config import (apply_diffusion_head_lora, apply_lm_lora,
+from vibevoice.finetune.utils.callbacks import create_callbacks
+from vibevoice.finetune.utils.data_utils import setup_data_pipeline
+from vibevoice.finetune.utils.lora_config import (apply_diffusion_head_lora, apply_lm_lora,
                                enable_lm_lora_parameters,
                                freeze_all_parameters)
-from utils.model_introspection import (ModelComponents,
+from vibevoice.finetune.utils.model_introspection import (ModelComponents,
                                        freeze_diffusion_head_layers,
                                        setup_connector_training,
                                        setup_diffusion_head_training,
                                        setup_tokenizer_freezing)
-from utils.model_setup import (freeze_embeddings_and_head, hard_tie_lm_head,
+from vibevoice.finetune.utils.model_setup import (freeze_embeddings_and_head, hard_tie_lm_head,
                                load_model, load_processor,
                                log_lm_head_diagnostics,
                                log_trainable_parameters,
                                patch_acoustic_encode_for_legacy_indexing,
                                setup_model_cache_and_tokenizers,
                                validate_special_tokens)
-from utils.trainer import VibeVoiceTrainer
+from vibevoice.finetune.utils.trainer import VibeVoiceTrainer
 
 logger = logging.getLogger(__name__)
 
