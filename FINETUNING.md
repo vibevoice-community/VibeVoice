@@ -35,7 +35,7 @@ python -m vibevoice.finetune.train_vibevoice \
     --lora_target_modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
     --lr_scheduler_type cosine \
     --warmup_ratio 0.03 \
-    --max_grad_norm 0.8 \
+    --max_grad_norm 0.8
 ```
 
 ## Notes
