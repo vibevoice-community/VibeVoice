@@ -2,6 +2,8 @@
 
 More instructions coming soon.
 
+Join the [Discord](https://discord.gg/ZDEYTTRxWG) for support.
+
 Example script:
 
 ```bash
