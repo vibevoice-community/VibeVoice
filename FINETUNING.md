@@ -9,7 +9,7 @@ Example script:
 ```bash
 python -m vibevoice.finetune.train_vibevoice \
     --model_name_or_path vibevoice/VibeVoice-1.5B \
-    --dataset_name canopylabs/zac-sample-dataset \
+    --dataset_name vibevoice/jenny_vibevoice_formatted \
     --text_column_name text \
     --audio_column_name audio \
     --voice_prompts_column_name audio \
@@ -17,7 +17,7 @@ python -m vibevoice.finetune.train_vibevoice \
     --per_device_train_batch_size 8 \
     --gradient_accumulation_steps 16 \
     --learning_rate 2.5e-5 \
-    --num_train_epochs 5 \
+    --num_train_epochs 1 \
     --logging_steps 10 \
     --save_steps 100 \
     --eval_steps 100 \
@@ -43,3 +43,5 @@ python -m vibevoice.finetune.train_vibevoice \
 - Currently, only single-speaker finetuning is supported. Podcast fine-tuning is not supported yet.
 - This is an unofficial finetuning implementation, it has not been validated by the original authors.
 - The `voice_prompts_column_name` parameter is currently set to `audio` in the example above, which means the same audio file is used for both training data and voice prompts. This is appropriate when you don't have separate voice prompt files. However, if your dataset includes dedicated voice prompt files (short audio clips that capture the target speaker's voice characteristics), you should specify a different column name that contains these separate voice prompt files. For podcast-style training (once it is supported), the model typically uses the first utterance from each speaker within the podcast episode as the voice prompt, meaning the voice prompt is extracted from the beginning of the same audio file used for training.
+- The dataset text/transcript must be in the format of "Speaker X: text", even if there is only one speaker. Example: `Speaker 1: Hello, how are you?`
+- The default dataset is the Jenny (Dioco) dataset. This is a small dataset for testing purposes and each segment is only a few seconds long. The model may struggle to generate long audio with this dataset.
