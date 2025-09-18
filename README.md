@@ -75,7 +75,7 @@ We'd like to thank [PsiPi](https://huggingface.co/PsiPi) for sharing an interest
 
 ```bash
 python demo/gradio_demo.py --model_path vibevoice/VibeVoice-1.5B --share
-# or python demo/gradio_demo.py --model_path vibevoice/VibeVoice-Large --share
+# or python demo/gradio_demo.py --model_path vibevoice/VibeVoice-7B --share
 ```
 
 **Option 2: Inference from files directly**
@@ -83,10 +83,10 @@ python demo/gradio_demo.py --model_path vibevoice/VibeVoice-1.5B --share
 ```bash
 # We provide some LLM generated example scripts under demo/text_examples/ for demo
 # 1 speaker
-python demo/inference_from_file.py --model_path vibevoice/VibeVoice-Large --txt_path demo/text_examples/1p_abs.txt --speaker_names Alice
+python demo/inference_from_file.py --model_path vibevoice/VibeVoice-7B --txt_path demo/text_examples/1p_abs.txt --speaker_names Alice
 
 # or more speakers
-python demo/inference_from_file.py --model_path vibevoice/VibeVoice-Large --txt_path demo/text_examples/2p_music.txt --speaker_names Alice Frank
+python demo/inference_from_file.py --model_path vibevoice/VibeVoice-7B --txt_path demo/text_examples/2p_music.txt --speaker_names Alice Frank
 ```
 
 
