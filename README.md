@@ -1,7 +1,43 @@
-> [!IMPORTANT]
-> This is a community-maintained fork of VibeVoice. Following the removal of the official VibeVoice repository, this fork serves to preserve the codebase and maintain accessibility for the community while also introducing additional functionality (such as unofficial training/fine-tuning implementations)
+**IMPORTANT:** I only modifed the demo/inference_from_file.py code. Please note that these newfunctions won't work with other inference examples like gradio or ipynb.
+## Modified features:
+- added 4bit bnb quantization option to the inference file
+- added lora support (**IMPORTANT: it doesn't work with 4bit quantization**)
 
-## 🎙️ VibeVoice: A Frontier Long Conversational Text-to-Speech Model
+## Installation
+### Clone the repo
+```
+git clone https://github.com/cseti007/VibeVoice
+cd VibeVoice
+```
+### Create virtual environment
+```
+python -m venv venv
+
+# Activate virtual environment
+#On Linux/Mac:
+source venv/bin/activate
+#On Windows:
+venv\Scripts\activate
+```
+### Install VibeVoice
+```
+# From the VibeVoice directory
+pip install -e .
+```
+
+**Basic Usage:**
+```
+python inference_from_file.py --model_path aoi-ot/VibeVoice-Large --txt_path text_examples/yourtextfile.txt --quantize_llm 4bit --speaker_names your_speaker
+```
+
+**Lora Usage:**
+- Download a LoRA file
+- If you have a diffusion head LoRA, put it into a folder named diffusion_head.
+- make sure the --lora_path parameter points to its parent folder. E.g. If your lora is in workspace/loras/diffusion_head/ folder, then you have to set the --lora_path parameter like --lora_path workspace/loras
+
+```
+python inference_from_file.py --model_path aoi-ot/VibeVoice-Large --txt_path text_examples/yourtextfile.txt --lora_path /path/to/your/lora --use_diffusion_head_lora --seed random --output output/output.wav
+```
 
 [![Project Page](https://img.shields.io/badge/Project-Page-blue)](https://microsoft.github.io/VibeVoice)
 [![Hugging Face](https://img.shields.io/badge/Hugging_Face-Models-orange?logo=huggingface)](https://huggingface.co/vibevoice)

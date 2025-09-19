@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from transformers.models.auto import AutoModel, AutoModelForCausalLM
+from transformers import BitsAndBytesConfig
 
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import CausalLMOutput, BaseModelOutputWithPast, ModelOutput
@@ -116,9 +117,34 @@ class VibeVoiceModel(VibeVoicePreTrainedModel):
         else:
             dtype = torch.float32
         
-        # Initialize Qwen2 model for language modeling
-        lm_config = config.decoder_config 
-        self.language_model = AutoModel.from_config(lm_config)
+        # Initialize Qwen2 model for language modeling with optional GPTQ support
+        lm_config = config.decoder_config
+        
+        # Handle GPTQ quantization
+        quantize_llm = getattr(config, 'quantize_llm', 'none')
+        
+        if quantize_llm == 'gptq':
+            try:
+                print("Loading GPTQ pre-quantized Qwen2.5 model...")
+                
+                # Use pre-quantized GPTQ model that matches VibeVoice-Large (7B)
+                gptq_model_path = "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4"
+                
+                # Try with optimum's GPTQ support first
+                self.language_model = AutoModelForCausalLM.from_pretrained(
+                    gptq_model_path,
+                    torch_dtype="auto",
+                    device_map="cuda",
+                    trust_remote_code=True
+                )
+                print(f"Successfully loaded GPTQ model with optimum from {gptq_model_path}")
+            except Exception as e:
+                print(f"Failed to load GPTQ model with optimum: {e}")
+                print("Falling back to standard model...")
+                self.language_model = AutoModel.from_config(lm_config)
+        else:
+            # Standard loading
+            self.language_model = AutoModel.from_config(lm_config)
         
         # Initialize speech components if needed
         self.acoustic_tokenizer = AutoModel.from_config(config.acoustic_tokenizer_config).to(dtype)
@@ -428,7 +454,7 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
             
             timesteps = torch.multinomial(
                 torch.ones(self.config.diffusion_head_config.ddpm_num_steps),
-                speech_len * ddpm_batch_mul,
+                speech_len * ddmp_batch_mul,
                 replacement=True,
             ).to(hidden_states.device)
 
