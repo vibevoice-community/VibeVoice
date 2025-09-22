@@ -339,6 +339,7 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         speech_tensors: Optional[torch.FloatTensor] = None,
         speech_masks: Optional[torch.BoolTensor] = None,
         speech_input_mask: Optional[torch.BoolTensor] = None,
+        is_prefill: bool = True,
         return_speech: bool = True,
         cfg_scale: float = 1.0,
         stop_check_fn: Optional[Callable[[], bool]] = None,
@@ -390,7 +391,6 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         device = input_ids.device
         finished_tags = torch.zeros(batch_size, dtype=torch.bool, device=device)
         correct_cnt = torch.zeros(batch_size, dtype=torch.long, device=device)
-        is_prefill = True
         inputs_embeds = None
         verbose = kwargs.get("verbose", False)
 
