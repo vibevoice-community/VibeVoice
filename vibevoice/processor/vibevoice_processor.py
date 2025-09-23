@@ -575,26 +575,48 @@ class VibeVoiceProcessor:
         with open(text_file, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         
-        script_lines = []
-        current_speaker = 1
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
+        script_lines: List[str] = []
+        current_speaker: Optional[int] = None
+        current_block: List[str] = []
+
+        for raw_line in lines:
+            stripped_line = raw_line.rstrip("\n")
+            cleaned_line = stripped_line.strip()
+            if not cleaned_line:
                 continue
-            
-            # Try to parse as "Speaker X: text" format
-            # Use regex to be more robust
-            speaker_match = re.match(r'^Speaker\s+(\d+)\s*:\s*(.*)$', line, re.IGNORECASE)
-            
+
+            speaker_match = re.match(r'^Speaker\s+(\d+)\s*:\s*(.*)$', cleaned_line, re.IGNORECASE)
+
             if speaker_match:
-                speaker_id = int(speaker_match.group(1))
-                text = speaker_match.group(2).strip()
-                if text:
-                    script_lines.append(f"Speaker {speaker_id}: {text}")
+                try:
+                    speaker_id = int(speaker_match.group(1))
+                except (TypeError, ValueError):
+                    logger.warning(f"Invalid speaker ID encountered: {speaker_match.group(1)}. Treating line as continuation text.")
+                    speaker_match = None
+                    speaker_id = None
+
+            if speaker_match:
+                # Flush any pending block before starting a new speaker block
+                if current_block:
+                    script_lines.extend(current_block)
+                    current_block = []
+
+                current_speaker = speaker_id
+                first_text = speaker_match.group(2).strip()
+                if first_text:
+                    current_block.append(f"Speaker {speaker_id}: {first_text}")
+                else:
+                    current_block.append(f"Speaker {speaker_id}:")
             else:
-                # Treat as plain text - assign to current speaker
-                script_lines.append(f"Speaker {current_speaker}: {line}")
+                if current_speaker is None:
+                    # Default to Speaker 1 if the file starts with plain text
+                    current_speaker = 1
+                    current_block = [f"Speaker {current_speaker}: {cleaned_line}"]
+                else:
+                    current_block.append(cleaned_line)
+
+        if current_block:
+            script_lines.extend(current_block)
         
         if not script_lines:
             raise ValueError("No valid content found in text file")
@@ -603,29 +625,55 @@ class VibeVoiceProcessor:
 
     def _parse_script(self, script: str) -> List[Tuple[int, str]]:
         """Parse script into list of (speaker_id, text) tuples."""
-        lines = script.strip().split("\n")
-        parsed_lines = []
-        speaker_ids = []
-                
-        # First pass: parse all lines and collect speaker IDs
-        for line in lines:
-            if not line.strip():
+        lines = script.splitlines()
+        parsed_lines: List[Tuple[int, str]] = []
+        current_speaker: Optional[int] = None
+        current_text: List[str] = []
+
+        def flush_current_speaker():
+            nonlocal current_text, current_speaker, parsed_lines
+            if current_speaker is None:
+                return
+            combined_text = "\n".join(current_text).strip()
+            if combined_text:
+                parsed_lines.append((current_speaker, f" {combined_text}"))
+            current_text = []
+
+        for raw_line in lines:
+            stripped_line = raw_line.rstrip("\n")
+            cleaned_line = stripped_line.strip()
+
+            if not cleaned_line:
                 continue
-                
-            # Use regex to handle edge cases like multiple colons
-            match = re.match(r'^Speaker\s+(\d+)\s*:\s*(.*)$', line.strip(), re.IGNORECASE)
-            
+
+            match = re.match(r'^Speaker\s+(\d+)\s*:\s*(.*)$', cleaned_line, re.IGNORECASE)
+
             if match:
-                speaker_id = int(match.group(1))
-                text = ' ' + match.group(2).strip()
-                parsed_lines.append((speaker_id, text))
-                speaker_ids.append(speaker_id)
+                try:
+                    speaker_id = int(match.group(1))
+                except (TypeError, ValueError):
+                    logger.warning(f"Invalid speaker ID in line: '{raw_line}'. Treating as continuation text.")
+                else:
+                    flush_current_speaker()
+                    current_speaker = speaker_id
+                    first_text = match.group(2).strip()
+                    current_text = [first_text] if first_text else []
+                    continue
+
+            if current_speaker is None:
+                logger.warning(f"Encountered text before any speaker label: '{raw_line.strip()}'. Assigning to Speaker 1.")
+                current_speaker = 1
+                current_text = [cleaned_line]
             else:
-                logger.warning(f"Could not parse line: '{line}'")
-        
+                current_text.append(cleaned_line)
+
+        flush_current_speaker()
+
         if not parsed_lines:
             raise ValueError("No valid speaker lines found in script")
-        
+
+        speaker_ids = [speaker_id for speaker_id, _ in parsed_lines]
+
         # Check if we need to normalize speaker IDs (only if all are > 0)
         min_speaker_id = min(speaker_ids)
         if min_speaker_id > 0:
