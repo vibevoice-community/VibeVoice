@@ -155,14 +155,23 @@ class VibeVoiceCollator:
             elif _drop_rate > 1.0:
                 _drop_rate = 1.0
 
-            proc = self.processor(
-                text=[text],
-                voice_samples=[voice_prompts] if voice_prompts is not None and random.random() >= _drop_rate else None,
-                padding=False,
-                truncation=False,
-                max_length=self.max_length,
-                return_tensors="pt",
-            )
+            try:
+                proc = self.processor(
+                    text=[text],
+                    voice_samples=[voice_prompts] if voice_prompts is not None and random.random() >= _drop_rate else None,
+                    padding=False,
+                    truncation=False,
+                    max_length=self.max_length,
+                    return_tensors="pt",
+                )
+            except ValueError as err:
+                if "No valid speaker lines" in str(err):
+                    warnings.warn(
+                        "Skipping training example with no valid speaker lines in text column",
+                        RuntimeWarning,
+                    )
+                    continue
+                raise
 
             ids = proc["input_ids"][0].tolist()
             attn = proc.get("attention_mask", torch.ones_like(proc["input_ids"]))[0].tolist()
@@ -256,6 +265,11 @@ class VibeVoiceCollator:
             all_speech_waveforms.append(wav_target)
             all_speech_latent_lengths.append(target_latent_len)
             per_segment_is_target.append(True)
+
+        if not sample_input_ids:
+            raise ValueError(
+                "Batch contained no valid training examples after filtering out items without speaker lines."
+            )
 
         max_seq_len = max(len(x) for x in sample_input_ids)
         padded_input_ids = []

@@ -1,6 +1,7 @@
 # train_vibevoice_lora.py
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -505,6 +506,68 @@ def main() -> None:
         elif data_args.eval_split_size and data_args.eval_split_size > 0 and len(train_ds) > 1:
             split = train_ds.train_test_split(test_size=data_args.eval_split_size, seed=training_args.seed)
             train_ds, eval_ds = split["train"], split["test"]
+
+    speaker_line_pattern = re.compile(r'^Speaker\s+(\d+)\s*:\s*(.*)$', re.IGNORECASE)
+
+    def _example_has_valid_speaker(example: Dict[str, Any]) -> bool:
+        text_val = example.get(data_args.text_column_name)
+        if not isinstance(text_val, str):
+            return False
+
+        current_speaker = None
+        current_block: List[str] = []
+        has_valid = False
+
+        def commit_block() -> None:
+            nonlocal current_block, has_valid
+            if current_block and any(part.strip() for part in current_block):
+                has_valid = True
+            current_block = []
+
+        for raw_line in text_val.splitlines():
+            cleaned = raw_line.strip()
+            if not cleaned:
+                continue
+
+            match = speaker_line_pattern.match(cleaned)
+            if match:
+                if current_speaker is not None:
+                    commit_block()
+                    if has_valid:
+                        break
+                current_speaker = match.group(1)
+                first_text = match.group(2).strip()
+                current_block = [first_text] if first_text else []
+            else:
+                if current_speaker is None:
+                    continue
+                current_block.append(cleaned)
+
+        if not has_valid and current_speaker is not None:
+            commit_block()
+
+        return has_valid
+
+    train_before = len(train_ds)
+    train_ds = train_ds.filter(_example_has_valid_speaker)
+    train_after = len(train_ds)
+    if train_after < train_before:
+        logger.info(
+            "Filtered training dataset to entries with speaker lines: %d -> %d",
+            train_before,
+            train_after,
+        )
+
+    if eval_ds is not None:
+        eval_before = len(eval_ds)
+        eval_ds = eval_ds.filter(_example_has_valid_speaker)
+        eval_after = len(eval_ds)
+        if eval_after < eval_before:
+            logger.info(
+                "Filtered evaluation dataset to entries with speaker lines: %d -> %d",
+                eval_before,
+                eval_after,
+            )
 
     train_dataset = VibeVoiceDataset(
         train_ds,
