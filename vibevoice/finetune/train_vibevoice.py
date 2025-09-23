@@ -4,24 +4,54 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+import os
+os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
+
+from unsloth import FastModel
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from datasets import load_dataset, DatasetDict, VerificationMode
+
 
 from transformers import (
     HfArgumentParser,
     Trainer,
     set_seed,
     TrainerCallback,
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoProcessor,
 )
+from transformers.models.auto.tokenization_auto import TOKENIZER_MAPPING
+from transformers.models.auto.processing_auto import PROCESSOR_MAPPING
+from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
+from transformers.models.qwen2.tokenization_qwen2 import Qwen2Tokenizer
 from transformers import TrainingArguments as HfTrainingArguments
-
 from peft import LoraConfig, get_peft_model, TaskType
 
 from vibevoice.modular.modeling_vibevoice import VibeVoiceForConditionalGeneration
-from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
+from vibevoice.modular.configuration_vibevoice import (
+    VibeVoiceConfig,
+    VibeVoiceAcousticTokenizerConfig,
+    VibeVoiceSemanticTokenizerConfig,
+    VibeVoiceDiffusionHeadConfig,
+)
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
+
+# Register the custom VibeVoice configurations and model with transformers
+AutoConfig.register("vibevoice", VibeVoiceConfig)
+AutoConfig.register("vibevoice_acoustic_tokenizer", VibeVoiceAcousticTokenizerConfig)
+AutoConfig.register("vibevoice_semantic_tokenizer", VibeVoiceSemanticTokenizerConfig)
+AutoConfig.register("vibevoice_diffusion_head", VibeVoiceDiffusionHeadConfig)
+AutoModelForCausalLM.register(VibeVoiceConfig, VibeVoiceForConditionalGeneration)
+
+# Register tokenizer mapping (VibeVoice uses Qwen2 tokenizer)
+TOKENIZER_MAPPING.register(VibeVoiceConfig, (Qwen2Tokenizer, Qwen2TokenizerFast))
+
+# Register processor mapping (VibeVoice uses VibeVoiceProcessor)
+PROCESSOR_MAPPING.register(VibeVoiceConfig, VibeVoiceProcessor)
 
 from vibevoice.finetune.data_vibevoice import VibeVoiceDataset, VibeVoiceCollator
 
@@ -260,15 +290,36 @@ def main() -> None:
     # Load model
     if model_args.model_name_or_path is None:
         raise ValueError("--model_name_or_path is required to load VibeVoice base model")
+    
+    logger.info(f"Loading model from: {model_args.model_name_or_path}")
+    
+    # Ensure registrations are active (sometimes they need to be re-registered)
+    logger.info("Re-registering VibeVoice configurations with transformers...")
+    AutoConfig.register("vibevoice", VibeVoiceConfig)
+    AutoConfig.register("vibevoice_acoustic_tokenizer", VibeVoiceAcousticTokenizerConfig)
+    AutoConfig.register("vibevoice_semantic_tokenizer", VibeVoiceSemanticTokenizerConfig)
+    AutoConfig.register("vibevoice_diffusion_head", VibeVoiceDiffusionHeadConfig)
+    AutoModelForCausalLM.register(VibeVoiceConfig, VibeVoiceForConditionalGeneration)
+    TOKENIZER_MAPPING.register(VibeVoiceConfig, (Qwen2Tokenizer, Qwen2TokenizerFast))
+    PROCESSOR_MAPPING.register(VibeVoiceConfig, VibeVoiceProcessor)
+    
     dtype = torch.float32
     if training_args.bf16:
         dtype = torch.bfloat16
     elif getattr(training_args, "fp16", False):
         dtype = torch.float16
-    model = VibeVoiceForConditionalGeneration.from_pretrained(
-        model_args.model_name_or_path,
-        torch_dtype=dtype,
+    
+
+    model,tokenizer = FastModel.from_pretrained(
+            model_args.model_name_or_path,
+            auto_model=VibeVoiceForConditionalGeneration,
+            dtype=dtype,
+            whisper_language="none",
+            whisper_task="none",
+            use_gradient_checkpointing = "unsloth" if training_args.gradient_checkpointing else False,
+            load_in_4bit = False
     )
+
     _patch_acoustic_encode_for_legacy_indexing(model, logger)
     processor.semantic_tokenizer = getattr(model.model, "semantic_tokenizer", None)
 
@@ -356,7 +407,7 @@ def main() -> None:
             logits = model.lm_head(outputs.last_hidden_state)
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = simple_ids[:, 1:].contiguous()
-            ce_loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), reduction='mean')
+            ce_loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             logger.info(f"Simple text CE loss: {ce_loss.item():.4f}")
     except Exception as e:
         logger.warning(f"Tokenizer diagnostics failed: {e}")
@@ -631,6 +682,7 @@ def main() -> None:
             x = model.get_input_embeddings()(input_ids)
 
             semantic_speech_all_connect_features = model.model.semantic_connector(speech_semantic_tensors)
+            x = x.clone()
             if speeches_loss_input is not None:
                 # only part audio need diffuse
                 speech_all_features, speech_all_connect_features = model.forward_speech_features(
@@ -989,11 +1041,6 @@ def main() -> None:
         except Exception as e:
             logger.warning(f"[debug_save] Unexpected failure saving initial components: {e}")
 
-    if getattr(training_args, "gradient_checkpointing", False):
-        try:
-            model.gradient_checkpointing_enable()
-        except Exception:
-            logger.warning("Failed to enable gradient checkpointing on the model.")
 
     if training_args.do_train:
         trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
