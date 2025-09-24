@@ -62,3 +62,4 @@ python -m vibevoice.finetune.train_vibevoice \
   ```
 
   Replace `--num_processes` with the number of GPUs you want to use and include the regular training arguments shown above. Accelerate takes care of launching one process per device and the training script automatically unwraps models so the LoRA and diffusion components stay trainable across ranks.
+- Fully Sharded Data Parallel (FSDP) is available via Accelerate/HF Trainer. Pass options such as `--fsdp "full_shard auto_wrap"` and, if needed, tweak `--fsdp_config` to control CPU offload or wrapping policies. The finetuning script gathers adapter checkpoints with `accelerator.get_state_dict`, so only the main rank writes the LoRA/diffusion connector artifacts.

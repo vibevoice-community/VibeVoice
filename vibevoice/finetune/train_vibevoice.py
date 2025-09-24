@@ -19,11 +19,6 @@ from transformers import TrainingArguments as HfTrainingArguments
 
 from peft import LoraConfig, get_peft_model, TaskType
 
-try:
-    from accelerate.utils import unwrap_model as accelerate_unwrap_model  # type: ignore
-except Exception:  # pragma: no cover - accelerate is an explicit dependency but keep fallback
-    accelerate_unwrap_model = None
-
 from vibevoice.modular.modeling_vibevoice import VibeVoiceForConditionalGeneration
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
@@ -33,18 +28,125 @@ from vibevoice.finetune.data_vibevoice import VibeVoiceDataset, VibeVoiceCollato
 logger = logging.getLogger(__name__)
 
 # Helper to consistently access the underlying (unwrapped) model when running
-# under Accelerate / DDP. Accelerate exposes an `unwrap_model` helper which we
-# prefer to use when available, but we keep a generic fallback to support unit
-# tests or environments where Accelerate is not initialised yet.
+# under Accelerate / DDP / FSDP. We recursively unwrap common wrapper
+# containers so downstream code can rely on the base module structure.
 def _unwrap_model(model: nn.Module) -> nn.Module:
-    if accelerate_unwrap_model is not None:
-        try:
-            return accelerate_unwrap_model(model)
-        except Exception:
-            pass
-    while hasattr(model, "module"):
-        model = getattr(model, "module")  # type: ignore[assignment]
+    if model is None:
+        return model
+    # Handle FullyShardedDataParallel wrappers
+    wrapped = getattr(model, "_fsdp_wrapped_module", None)
+    if wrapped is not None:
+        return _unwrap_model(wrapped)
+    # Handle accelerate mixed precision wrappers
+    wrapped = getattr(model, "_orig_mod", None)
+    if wrapped is not None:
+        return _unwrap_model(wrapped)
+    # Handle generic DataParallel/DistributedDataParallel wrappers
+    wrapped = getattr(model, "module", None)
+    if wrapped is not None:
+        return _unwrap_model(wrapped)
     return model
+
+
+def _is_main_process(accelerator=None) -> bool:
+    if accelerator is not None:
+        return bool(getattr(accelerator, "is_main_process", True))
+    try:
+        import torch.distributed as dist
+
+        if not dist.is_available() or not dist.is_initialized():
+            return True
+        return dist.get_rank() == 0
+    except Exception:
+        return True
+
+
+def _collect_state_dict(
+    name: str,
+    wrapped_module: Optional[nn.Module],
+    base_module: Optional[nn.Module],
+    accelerator=None,
+):
+    module_for_state = wrapped_module if wrapped_module is not None else base_module
+    if module_for_state is None:
+        return None
+    if accelerator is not None:
+        try:
+            return accelerator.get_state_dict(module_for_state)
+        except Exception as exc:
+            logger.warning(f"Failed to gather state_dict for '{name}' via accelerator: {exc}")
+    target = base_module or _unwrap_model(module_for_state)
+    if target is None:
+        return None
+    try:
+        return target.state_dict()
+    except Exception as exc:
+        logger.warning(f"Failed to obtain state_dict for '{name}': {exc}")
+        return None
+
+
+def _export_adapters_and_connectors(model_wrapped: nn.Module, accelerator, target_dir: str) -> None:
+    """Save LoRA adapters, diffusion head, and connectors in a distributed-safe way."""
+    base_model = _unwrap_model(model_wrapped)
+    core_wrapped = getattr(model_wrapped, "model", None) or model_wrapped
+    core_base = getattr(base_model, "model", None) or base_model
+
+    def _pair(attr: str) -> Tuple[Optional[nn.Module], Optional[nn.Module]]:
+        wrapped = getattr(core_wrapped, attr, None)
+        base = getattr(core_base, attr, None)
+        if base is not None:
+            base = _unwrap_model(base)
+        return wrapped, base
+
+    os.makedirs(target_dir, exist_ok=True)
+    is_main = _is_main_process(accelerator)
+
+    # LLM adapters
+    language_wrapped, language_base = _pair("language_model")
+    if language_base is not None and hasattr(language_base, "save_pretrained"):
+        lm_state = _collect_state_dict("language_model", language_wrapped, language_base, accelerator)
+        if is_main:
+            try:
+                language_base.save_pretrained(target_dir, state_dict=lm_state)
+            except TypeError:
+                # Older PEFT versions may not accept state_dict argument
+                language_base.save_pretrained(target_dir)
+
+    # Diffusion head adapters / weights
+    pred_wrapped, pred_base = _pair("prediction_head")
+    if pred_base is not None:
+        pred_dir = os.path.join(target_dir, "diffusion_head")
+        pred_state = _collect_state_dict("diffusion_head", pred_wrapped, pred_base, accelerator)
+        if is_main:
+            os.makedirs(pred_dir, exist_ok=True)
+            if hasattr(pred_base, "save_pretrained"):
+                try:
+                    pred_base.save_pretrained(pred_dir, state_dict=pred_state)
+                except TypeError:
+                    pred_base.save_pretrained(pred_dir)
+            if pred_state is not None:
+                torch.save(pred_state, os.path.join(target_dir, "diffusion_head_full.bin"))
+                torch.save(pred_state, os.path.join(pred_dir, "diffusion_head_full.bin"))
+
+    # Connectors (always plain state_dict)
+    ac_wrapped, ac_base = _pair("acoustic_connector")
+    if ac_base is not None:
+        ac_state = _collect_state_dict("acoustic_connector", ac_wrapped, ac_base, accelerator)
+        if is_main and ac_state is not None:
+            ac_dir = os.path.join(target_dir, "acoustic_connector")
+            os.makedirs(ac_dir, exist_ok=True)
+            torch.save(ac_state, os.path.join(ac_dir, "pytorch_model.bin"))
+
+    se_wrapped, se_base = _pair("semantic_connector")
+    if se_base is not None:
+        se_state = _collect_state_dict("semantic_connector", se_wrapped, se_base, accelerator)
+        if is_main and se_state is not None:
+            se_dir = os.path.join(target_dir, "semantic_connector")
+            os.makedirs(se_dir, exist_ok=True)
+            torch.save(se_state, os.path.join(se_dir, "pytorch_model.bin"))
+
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
 
 # ================== SAMPLE CALLBACK UTILS ==================
 
@@ -919,44 +1021,7 @@ def main() -> None:
             try:
                 target_dir = output_dir or self.args.output_dir
                 lora_out = os.path.join(target_dir, "lora")
-                os.makedirs(lora_out, exist_ok=True)
-
-                base_model = _unwrap_model(self.model)
-                core_model = getattr(base_model, "model", base_model)
-
-                # --- LLM PEFT adapters (if LoRA-wrapped) ---
-                language_model = getattr(core_model, "language_model", None)
-                if hasattr(language_model, "save_pretrained"):
-                    language_model.save_pretrained(lora_out)
-
-                # --- Diffusion head PEFT adapters (if LoRA-wrapped) ---
-                pred_head = getattr(core_model, "prediction_head", None)
-                if hasattr(pred_head, "save_pretrained"):
-                    ph_dir = os.path.join(lora_out, "diffusion_head")
-                    os.makedirs(ph_dir, exist_ok=True)
-                    pred_head.save_pretrained(ph_dir)
-    
-                # --- ALWAYS save FULL diffusion head state_dict for fallback ---
-                if pred_head is not None and hasattr(pred_head, "state_dict"):
-                    sd = pred_head.state_dict()
-                    torch.save(sd, os.path.join(lora_out, "diffusion_head_full.bin"))
-                    ph_dir = os.path.join(lora_out, "diffusion_head")
-                    os.makedirs(ph_dir, exist_ok=True)
-                    torch.save(sd, os.path.join(ph_dir, "diffusion_head_full.bin"))
-
-                # --- Connectors (plain state_dicts) ---
-                ac = getattr(core_model, "acoustic_connector", None)
-                if ac is not None:
-                    ac_dir = os.path.join(lora_out, "acoustic_connector")
-                    os.makedirs(ac_dir, exist_ok=True)
-                    torch.save(ac.state_dict(), os.path.join(ac_dir, "pytorch_model.bin"))
-
-                se = getattr(core_model, "semantic_connector", None)
-                if se is not None:
-                    se_dir = os.path.join(lora_out, "semantic_connector")
-                    os.makedirs(se_dir, exist_ok=True)
-                    torch.save(se.state_dict(), os.path.join(se_dir, "pytorch_model.bin"))
-    
+                _export_adapters_and_connectors(self.model, getattr(self, "accelerator", None), lora_out)
             except Exception as e:
                 logger.warning(f"Failed to save LoRA assets: {e}")
 
@@ -981,47 +1046,8 @@ def main() -> None:
         try:
             debug_dir = os.path.join(training_args.output_dir, "debug_initial")
             lora_out = os.path.join(debug_dir, "lora")
-            os.makedirs(lora_out, exist_ok=True)
             logger.info(f"[debug_save] Saving initial (pre-training) model components to: {debug_dir}")
-            # language model adapters / base
-            try:
-                if hasattr(model.model.language_model, "save_pretrained"):
-                    model.model.language_model.save_pretrained(lora_out)
-            except Exception as e_lm:
-                logger.warning(f"[debug_save] Failed to save language_model: {e_lm}")
-            # diffusion head
-            try:
-                if hasattr(model.model, "prediction_head") and hasattr(model.model.prediction_head, "save_pretrained"):
-                    model.model.prediction_head.save_pretrained(os.path.join(lora_out, "diffusion_head"))
-            except Exception as e_head:
-                logger.warning(f"[debug_save] Failed to save prediction_head: {e_head}")
-            # NEW: full diffusion head state_dict as fallback
-            try:
-                ph = getattr(model.model, "prediction_head", None)
-                if ph is not None and hasattr(ph, "state_dict"):
-                    sd = ph.state_dict()
-                    torch.save(sd, os.path.join(lora_out, "diffusion_head_full.bin"))
-                    os.makedirs(os.path.join(lora_out, "diffusion_head"), exist_ok=True)
-                    torch.save(sd, os.path.join(lora_out, "diffusion_head", "diffusion_head_full.bin"))
-            except Exception as e:
-                logger.warning(f"[debug_save] Failed to save FULL diffusion head: {e}")
-            # connectors
-            try:
-                ac_conn = getattr(model.model, "acoustic_connector", None)
-                if ac_conn is not None:
-                    ac_dir = os.path.join(lora_out, "acoustic_connector")
-                    os.makedirs(ac_dir, exist_ok=True)
-                    torch.save(ac_conn.state_dict(), os.path.join(ac_dir, "pytorch_model.bin"))
-            except Exception as e_ac:
-                logger.warning(f"[debug_save] Failed to save acoustic_connector: {e_ac}")
-            try:
-                se_conn = getattr(model.model, "semantic_connector", None)
-                if se_conn is not None:
-                    se_dir = os.path.join(lora_out, "semantic_connector")
-                    os.makedirs(se_dir, exist_ok=True)
-                    torch.save(se_conn.state_dict(), os.path.join(se_dir, "pytorch_model.bin"))
-            except Exception as e_se:
-                logger.warning(f"[debug_save] Failed to save semantic_connector: {e_se}")
+            _export_adapters_and_connectors(trainer.model, trainer.accelerator, lora_out)
         except Exception as e:
             logger.warning(f"[debug_save] Unexpected failure saving initial components: {e}")
 
@@ -1033,54 +1059,8 @@ def main() -> None:
 
     if training_args.do_train:
         trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
-
-        model_to_save = _unwrap_model(trainer.model)
-        core_model = getattr(model_to_save, "model", model_to_save)
-    
         lora_out = os.path.join(training_args.output_dir, "lora")
-        os.makedirs(lora_out, exist_ok=True)
-    
-        # LLM PEFT (if any)
-        lm = getattr(core_model, "language_model", None)
-        if hasattr(lm, "save_pretrained"):
-            lm.save_pretrained(lora_out)
-    
-        # Diffusion head PEFT (if any)
-        ph = getattr(core_model, "prediction_head", None)
-        if hasattr(ph, "save_pretrained"):
-            ph_dir = os.path.join(lora_out, "diffusion_head")
-            os.makedirs(ph_dir, exist_ok=True)
-            ph.save_pretrained(ph_dir)
-    
-        # ALWAYS: full diffusion head state_dict fallback
-        try:
-            if ph is not None and hasattr(ph, "state_dict"):
-                sd = ph.state_dict()
-                torch.save(sd, os.path.join(lora_out, "diffusion_head_full.bin"))
-                ph_dir = os.path.join(lora_out, "diffusion_head")
-                os.makedirs(ph_dir, exist_ok=True)
-                torch.save(sd, os.path.join(ph_dir, "diffusion_head_full.bin"))
-        except Exception as e:
-            logger.warning(f"Failed to save FULL diffusion head at end: {e}")
-    
-        # Connectors (if trained)
-        try:
-            ac = getattr(core_model, "acoustic_connector", None)
-            if ac is not None:
-                ac_dir = os.path.join(lora_out, "acoustic_connector")
-                os.makedirs(ac_dir, exist_ok=True)
-                torch.save(ac.state_dict(), os.path.join(ac_dir, "pytorch_model.bin"))
-        except Exception as e:
-            logger.warning(f"Failed to save acoustic_connector: {e}")
-    
-        try:
-            se = getattr(core_model, "semantic_connector", None)
-            if se is not None:
-                se_dir = os.path.join(lora_out, "semantic_connector")
-                os.makedirs(se_dir, exist_ok=True)
-                torch.save(se.state_dict(), os.path.join(se_dir, "pytorch_model.bin"))
-        except Exception as e:
-            logger.warning(f"Failed to save semantic_connector: {e}")
+        _export_adapters_and_connectors(trainer.model, trainer.accelerator, lora_out)
 
     if training_args.do_eval and eval_dataset is not None:
         trainer.evaluate()
