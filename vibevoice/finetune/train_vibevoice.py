@@ -19,6 +19,13 @@ from transformers import TrainingArguments as HfTrainingArguments
 
 from peft import LoraConfig, get_peft_model, TaskType
 
+from transformers.utils import (
+    ADAPTER_SAFE_WEIGHTS_NAME,
+    ADAPTER_WEIGHTS_NAME,
+    SAFE_WEIGHTS_NAME,
+    WEIGHTS_NAME,
+)
+
 from vibevoice.modular.modeling_vibevoice import VibeVoiceForConditionalGeneration
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
@@ -603,6 +610,143 @@ def main() -> None:
                 logger.warning(f"LoRA debug (on_step_end) failed: {e}")
 
     class VibeVoiceTrainer(Trainer):
+        def _is_lora_only_checkpoint(self, checkpoint_dir: str) -> bool:
+            if not os.path.isdir(checkpoint_dir):
+                return False
+
+            lora_dir = os.path.join(checkpoint_dir, "lora")
+            if not os.path.isdir(lora_dir):
+                return False
+
+            full_weight_files = [
+                os.path.join(checkpoint_dir, WEIGHTS_NAME),
+                os.path.join(checkpoint_dir, SAFE_WEIGHTS_NAME),
+            ]
+            if any(os.path.exists(p) for p in full_weight_files):
+                return False
+
+            # PEFT checkpoints may contain adapter weights under the root folder.
+            adapter_weight_files = [
+                os.path.join(checkpoint_dir, ADAPTER_WEIGHTS_NAME),
+                os.path.join(checkpoint_dir, ADAPTER_SAFE_WEIGHTS_NAME),
+            ]
+            if any(os.path.exists(p) for p in adapter_weight_files):
+                return True
+
+            # Otherwise, ensure the LoRA folder actually contains adapter weights.
+            lora_adapter_files = [
+                os.path.join(lora_dir, ADAPTER_WEIGHTS_NAME),
+                os.path.join(lora_dir, ADAPTER_SAFE_WEIGHTS_NAME),
+            ]
+            return any(os.path.exists(p) for p in lora_adapter_files)
+
+        @staticmethod
+        def _load_state_dict_file(state_path: str) -> Optional[Dict[str, torch.Tensor]]:
+            if not os.path.isfile(state_path):
+                return None
+
+            try:
+                if state_path.endswith(".safetensors"):
+                    from safetensors.torch import load_file
+
+                    return load_file(state_path)
+                return torch.load(state_path, map_location="cpu")
+            except Exception as e:
+                logger.warning(f"Failed to load state dict from {state_path}: {e}")
+                return None
+
+        def _load_lora_checkpoint(self, checkpoint_dir: str, model: Optional[nn.Module] = None) -> None:
+            target_model = model if model is not None else self.model
+            if target_model is None:
+                raise ValueError("Trainer has no model to load LoRA checkpoint into.")
+
+            lora_dir = os.path.join(checkpoint_dir, "lora")
+            logger.info(f"Loading LoRA checkpoint from {lora_dir}")
+
+            # Load language model LoRA weights
+            lm = getattr(target_model.model, "language_model", None)
+            if lm is not None:
+                adapter_paths = [
+                    os.path.join(checkpoint_dir, ADAPTER_SAFE_WEIGHTS_NAME),
+                    os.path.join(checkpoint_dir, ADAPTER_WEIGHTS_NAME),
+                    os.path.join(lora_dir, ADAPTER_SAFE_WEIGHTS_NAME),
+                    os.path.join(lora_dir, ADAPTER_WEIGHTS_NAME),
+                ]
+                adapter_state = None
+                for path in adapter_paths:
+                    adapter_state = self._load_state_dict_file(path)
+                    if adapter_state is not None:
+                        break
+
+                if adapter_state is not None:
+                    try:
+                        from peft.utils.save_and_load import set_peft_model_state_dict
+
+                        set_peft_model_state_dict(lm, adapter_state)
+                    except Exception as e:
+                        missing, unexpected = lm.load_state_dict(adapter_state, strict=False)
+                        if missing or unexpected:
+                            logger.warning(
+                                "LoRA LM load had missing/unexpected keys: missing=%s unexpected=%s (%s)",
+                                missing,
+                                unexpected,
+                                e,
+                            )
+                else:
+                    logger.warning("No adapter weights found for language_model in LoRA checkpoint.")
+            else:
+                logger.warning("Model has no language_model attribute; skipping LoRA adapter load.")
+
+            # Load diffusion head weights (full state dict fallback)
+            ph = getattr(target_model.model, "prediction_head", None)
+            if ph is not None:
+                diffusion_state = self._load_state_dict_file(os.path.join(lora_dir, "diffusion_head_full.bin"))
+                if diffusion_state is None:
+                    diffusion_state = self._load_state_dict_file(
+                        os.path.join(lora_dir, "diffusion_head", "diffusion_head_full.bin")
+                    )
+
+                if diffusion_state is not None:
+                    missing, unexpected = ph.load_state_dict(diffusion_state, strict=False)
+                    if missing or unexpected:
+                        logger.warning(
+                            "Diffusion head load had missing/unexpected keys: missing=%s unexpected=%s",
+                            missing,
+                            unexpected,
+                        )
+                else:
+                    logger.info("No diffusion head weights found in LoRA checkpoint; skipping load.")
+            else:
+                logger.info("No prediction_head on model; skipping diffusion head load.")
+
+            # Load connectors if available
+            for attr_name, subdir in (
+                ("acoustic_connector", "acoustic_connector"),
+                ("semantic_connector", "semantic_connector"),
+            ):
+                module = getattr(target_model.model, attr_name, None)
+                if module is None:
+                    continue
+
+                conn_path = os.path.join(lora_dir, subdir, "pytorch_model.bin")
+                state = self._load_state_dict_file(conn_path)
+                if state is not None:
+                    missing, unexpected = module.load_state_dict(state, strict=False)
+                    if missing or unexpected:
+                        logger.warning(
+                            "%s load had missing/unexpected keys: missing=%s unexpected=%s",
+                            attr_name,
+                            missing,
+                            unexpected,
+                        )
+
+        def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+            if resume_from_checkpoint and self._is_lora_only_checkpoint(resume_from_checkpoint):
+                self._load_lora_checkpoint(resume_from_checkpoint, model=model)
+                return
+
+            return super()._load_from_checkpoint(resume_from_checkpoint, model=model)
+
         def training_forward(self, model: VibeVoiceForConditionalGeneration, inputs: Dict[str, Any]):
             """Custom forward pass for training with new diffusion loss calculation."""
             # Extract inputs
