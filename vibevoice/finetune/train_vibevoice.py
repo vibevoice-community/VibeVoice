@@ -2,7 +2,7 @@
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -147,6 +147,26 @@ def _export_adapters_and_connectors(model_wrapped: nn.Module, accelerator, targe
 
     if accelerator is not None:
         accelerator.wait_for_everyone()
+
+
+def _cast_parameters_to_dtype(
+    module: Optional[nn.Module],
+    target_dtype: Optional[torch.dtype],
+    *,
+    filter_fn: Optional[Callable[[str, nn.Parameter], bool]] = None,
+) -> None:
+    """Utility to cast selected module parameters to a target dtype (in-place)."""
+    if module is None or target_dtype is None:
+        return
+    for name, param in module.named_parameters(recurse=True):
+        if filter_fn is not None and not filter_fn(name, param):
+            continue
+        if param.dtype == target_dtype:
+            continue
+        try:
+            param.data = param.data.to(dtype=target_dtype)
+        except Exception as exc:
+            logger.warning(f"Failed casting parameter '{name}' to {target_dtype}: {exc}")
 
 # ================== SAMPLE CALLBACK UTILS ==================
 
@@ -500,6 +520,11 @@ def main() -> None:
     skip_lm_lora = (len(tm_lower) == 0) or all(t in ("none", "off", "disable", "disabled") for t in tm_lower)
     if not skip_lm_lora:
         model.model.language_model = get_peft_model(model.model.language_model, lora_cfg)
+        _cast_parameters_to_dtype(
+            model.model.language_model,
+            dtype,
+            filter_fn=lambda name, _: ("lora_A" in name or "lora_B" in name or "lora_embedding" in name),
+        )
     else:
         logger.info("Skipping LLM LoRA wrapping (lora_target_modules indicates none).")
 
@@ -537,6 +562,11 @@ def main() -> None:
             for n, p in model.model.prediction_head.named_parameters():
                 if "lora_A" in n or "lora_B" in n:
                     p.requires_grad = True
+            _cast_parameters_to_dtype(
+                model.model.prediction_head,
+                dtype,
+                filter_fn=lambda name, _: ("lora_A" in name or "lora_B" in name or "lora_embedding" in name),
+            )
         except Exception as e:
             logger.warning(f"Could not LoRA-wrap diffusion head: {e}")
 
@@ -576,6 +606,11 @@ def main() -> None:
         if hasattr(model.model, "semantic_connector"):
             for p in model.model.semantic_connector.parameters():
                 p.requires_grad = False
+
+    # Align trainable parameter dtypes to avoid FSDP mixed precision issues
+    _cast_parameters_to_dtype(getattr(model.model, "prediction_head", None), dtype)
+    _cast_parameters_to_dtype(getattr(model.model, "acoustic_connector", None), dtype)
+    _cast_parameters_to_dtype(getattr(model.model, "semantic_connector", None), dtype)
 
     # Freeze embedding + head
     try:
