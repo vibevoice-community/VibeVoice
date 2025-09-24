@@ -98,23 +98,98 @@ class VibeVoiceDataset:
         return data
 
 
-def _load_audio_to_24k(audio: Union[str, np.ndarray, torch.Tensor, Dict[str, Any]], *, target_sr: int = 24000) -> np.ndarray:
+
+def _apply_silence_with_crossfade(
+    wav: np.ndarray,
+    *,
+    sample_rate: int,
+    pre_silence_sec: float = 0.25,
+    pre_crossfade_sec: float = 0.25,
+    post_crossfade_sec: float = 0.25,
+    post_silence_sec: float = 0.75,
+) -> np.ndarray:
+    """Pad audio with leading/trailing silence and apply crossfades.
+
+    Structure: [pre_silence][pre_crossfade][audio_body][post_crossfade][post_silence]
+    Crossfades blend the audio with silence linearly to avoid hard edges.
+    """
+
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+
+    start_sil_samples = int(round(pre_silence_sec * sample_rate))
+    end_sil_samples = int(round(post_silence_sec * sample_rate))
+    pre_crossfade_samples = int(round(pre_crossfade_sec * sample_rate))
+    post_crossfade_samples = int(round(post_crossfade_sec * sample_rate))
+
+    total_len = wav.shape[0]
+    if total_len == 0:
+        pieces: List[np.ndarray] = []
+        if start_sil_samples > 0:
+            pieces.append(np.zeros(start_sil_samples, dtype=np.float32))
+        if end_sil_samples > 0:
+            pieces.append(np.zeros(end_sil_samples, dtype=np.float32))
+        return np.concatenate(pieces) if pieces else wav
+
+    start_len = min(pre_crossfade_samples, total_len)
+    remaining_after_start = max(total_len - start_len, 0)
+    end_len = min(post_crossfade_samples, remaining_after_start)
+    middle_end_idx = total_len - end_len
+
+    start_segment = wav[:start_len]
+    middle_segment = wav[start_len:middle_end_idx]
+    end_segment = wav[middle_end_idx:]
+
+    def _linear_fade(num_samples: int, start: float, end: float) -> np.ndarray:
+        if num_samples <= 0:
+            return np.zeros((0,), dtype=np.float32)
+        return np.linspace(start, end, num_samples, endpoint=True, dtype=np.float32)
+
+    start_crossfade = start_segment * _linear_fade(start_len, 0.0, 1.0)
+    end_crossfade = end_segment * _linear_fade(end_segment.shape[0], 1.0, 0.0)
+
+    pieces: List[np.ndarray] = []
+    if start_sil_samples > 0:
+        pieces.append(np.zeros(start_sil_samples, dtype=np.float32))
+    if start_crossfade.size > 0:
+        pieces.append(start_crossfade.astype(np.float32, copy=False))
+    if middle_segment.size > 0:
+        pieces.append(middle_segment.astype(np.float32, copy=False))
+    if end_crossfade.size > 0:
+        pieces.append(end_crossfade.astype(np.float32, copy=False))
+    if end_sil_samples > 0:
+        pieces.append(np.zeros(end_sil_samples, dtype=np.float32))
+
+    return np.concatenate(pieces)
+
+
+def _load_audio_to_24k(
+    audio: Union[str, np.ndarray, torch.Tensor, Dict[str, Any]],
+    *,
+    target_sr: int = 24000,
+    augment_with_silence: bool = False,
+) -> np.ndarray:
     if isinstance(audio, np.ndarray):
-        return audio.astype(np.float32)
-    if isinstance(audio, torch.Tensor):
-        return audio.detach().cpu().float().numpy()
-    if isinstance(audio, str):
+        wav_out = audio.astype(np.float32)
+    elif isinstance(audio, torch.Tensor):
+        wav_out = audio.detach().cpu().float().numpy()
+    elif isinstance(audio, str):
         if librosa is None:
             raise RuntimeError("librosa is required to load audio file paths. Please pip install librosa.")
         wav, sr = librosa.load(audio, sr=None, mono=True)
-        wav = _resample_if_needed(wav, int(sr), target_sr)
-        return wav
-    if isinstance(audio, dict) and "array" in audio and "sampling_rate" in audio:
+        wav_out = _resample_if_needed(wav, int(sr), target_sr)
+    elif isinstance(audio, dict) and "array" in audio and "sampling_rate" in audio:
         arr = np.asarray(audio["array"], dtype=np.float32)
         sr = int(audio["sampling_rate"])
-        arr = _resample_if_needed(arr, sr, target_sr)
-        return arr
-    raise ValueError(f"Unsupported audio type: {type(audio)}")
+        wav_out = _resample_if_needed(arr, sr, target_sr)
+    else:
+        raise ValueError(f"Unsupported audio type: {type(audio)}")
+
+    wav_out = np.asarray(wav_out, dtype=np.float32)
+
+    if augment_with_silence:
+        wav_out = _apply_silence_with_crossfade(wav_out, sample_rate=target_sr)
+
+    return wav_out
 
 
 @dataclass
@@ -171,7 +246,7 @@ class VibeVoiceCollator:
                 speech_input_mask = torch.zeros_like(proc["input_ids"], dtype=torch.bool)
             speech_input_mask_list = speech_input_mask[0].tolist()
 
-            wav_target = _load_audio_to_24k(target_audio, target_sr=24000)
+            wav_target = _load_audio_to_24k(target_audio, target_sr=24000, augment_with_silence=True)
             # Prefer exact frame count from acoustic tokenizer if available; fallback to compress ratio
             target_latent_len = None
             try:
@@ -216,6 +291,16 @@ class VibeVoiceCollator:
             attn_extended.append(1)
             acoustic_input_mask.append(False)
             acoustic_loss_mask.append(False)
+
+            # Ensure text decoding sees an explicit end-of-sequence token after speech output.
+            eos_token_id = getattr(self.processor.tokenizer, "eos_id", None)
+            if eos_token_id is None:
+                eos_token_id = getattr(self.processor.tokenizer, "eos_token_id", None)
+            if eos_token_id is not None and eos_token_id >= 0:
+                ids_extended.append(eos_token_id)
+                attn_extended.append(1)
+                acoustic_input_mask.append(False)
+                acoustic_loss_mask.append(False)
 
             if self.max_length is not None and len(ids_extended) > self.max_length:
                 cut = len(ids_extended) - int(self.max_length)
