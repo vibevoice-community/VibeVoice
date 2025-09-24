@@ -53,3 +53,12 @@ python -m vibevoice.finetune.train_vibevoice \
 - The `voice_prompts_column_name` parameter is currently set to `audio` in the example above, which means the same audio file is used for both training data and voice prompts. This is appropriate when you don't have separate voice prompt files. However, if your dataset includes dedicated voice prompt files (short audio clips that capture the target speaker's voice characteristics), you should specify a different column name that contains these separate voice prompt files. For podcast-style training (once it is supported), the model typically uses the first utterance from each speaker within the podcast episode as the voice prompt, meaning the voice prompt is extracted from the beginning of the same audio file used for training.
 - The dataset text/transcript must be in the format of "Speaker X: text", even if there is only one speaker. Example: `Speaker 1: Hello, how are you?`
 - The default dataset is the Jenny (Dioco) dataset. This is a small dataset for testing purposes and each segment is only a few seconds long. The model may struggle to generate long audio with this dataset.
+- **Multi-GPU training** is now supported through 🤗 Accelerate. Configure your environment with `accelerate config` once, then launch training with something like:
+
+  ```bash
+  accelerate launch --num_processes 4 -m vibevoice.finetune.train_vibevoice \
+      --model_name_or_path vibevoice/VibeVoice-1.5B \
+      ...
+  ```
+
+  Replace `--num_processes` with the number of GPUs you want to use and include the regular training arguments shown above. Accelerate takes care of launching one process per device and the training script automatically unwraps models so the LoRA and diffusion components stay trainable across ranks.
