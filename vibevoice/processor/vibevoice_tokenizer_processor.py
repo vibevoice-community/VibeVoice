@@ -478,6 +478,10 @@ class VibeVoiceTokenizerProcessor(FeatureExtractionMixin):
                 audio = audio / max_val
         
         return audio
-
+    def push_to_hub(self, **kwargs):
+        """
+        Stub method for push to hub to make Unsloth happy.
+        """
+        raise NotImplementedError("Push to hub is not implemented for VibeVoiceTokenizerProcessor")
 
 __all__ = ["VibeVoiceTokenizerProcessor", "AudioNormalizer"]
