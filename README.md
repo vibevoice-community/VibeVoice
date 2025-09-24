@@ -62,6 +62,195 @@ uv pip install -e .
 ```
 
 ## Usage
+### OpenAI-compatible Audio API (local server)
+
+Run a local server that is compatible with the openai-python audio API (`client.audio.speech.create`). It wraps VibeVoice to synthesize speech from text.
+
+Start the server:
+
+```bash
+python -m vibevoice_api.server --model_path vibevoice/VibeVoice-1.5B --port 8000
+```
+
+#### API base path (`/v1` default)
+
+All routes are mounted on `/v1` by default. Override the prefix before launching the server by setting `VIBEVOICE_API_BASE_PATH` (leading slash required):
+
+```bash
+export VIBEVOICE_API_BASE_PATH=/api
+python -m vibevoice_api.server --model_path vibevoice/VibeVoice-1.5B --port 8000
+```
+
+Clients must include the same prefix when constructing URLs:
+
+```python
+base_path = "/api"  # matches VIBEVOICE_API_BASE_PATH
+client = OpenAI(base_url=f"http://127.0.0.1:8000{base_path}", api_key="<YOUR_API_KEY>")
+```
+
+The static console is served at `<base_path>/web/console.html`. Legacy root routes (e.g., `/audio/speech`, `/metrics`) remain for backwards compatibility, but new integrations should prefer the explicit prefix.
+
+Then test with either the official openai client (pip) or a pure-HTTP script.
+
+Option A — official openai (pip install openai ≥ 1.40):
+
+```python
+from openai import OpenAI
+client = OpenAI(
+    base_url="http://127.0.0.1:8000/v1",  # adjust if VIBEVOICE_API_BASE_PATH changes
+    api_key="<YOUR_API_KEY>",
+)
+
+speech = client.audio.speech.create(
+    model="vibevoice/VibeVoice-1.5B",  # or local path
+    voice="Andrew",                     # mapped to demo/voices/*.wav
+    input="Hello from VibeVoice!",
+    response_format="mp3",              # wav/pcm (native) or mp3/opus/aac (ffmpeg; flac removed)
+)
+
+with open("out.wav", "wb") as f:
+    f.write(speech.read())
+```
+
+> ℹ️ **Tip:** `mp3`, `opus`, and `aac` responses require a working ffmpeg binary (set `VIBEVOICE_FFMPEG` or ensure `ffmpeg` is on
+> PATH). When ffmpeg is unavailable the server will raise a clear error; `wav`/`pcm` continue to work without it.
+
+Option B — pure HTTP script (no openai dependency):
+
+```bash
+python scripts/api_audio_speech_test.py \
+  --base_url http://127.0.0.1:8000 \
+  --model_path "F:/VibeVoice-Large" \
+  --voice alloy \
+  --response_format mp3 \
+  --out outputs/api_http/out.mp3
+```
+
+Notes:
+- Base URL: if you override `VIBEVOICE_API_BASE_PATH`, point clients (`base_url`, `--base_url`, browser tabs) to the same prefix (e.g., `http://127.0.0.1:8000/api`).
+- Formats: `wav` and `pcm` are native. `mp3`, `opus`, `aac` require ffmpeg. Set `VIBEVOICE_FFMPEG` to the binary path or ensure `ffmpeg` is in PATH. (flac removed)
+- `voice` handling:
+  - Name mapping to `demo/voices/*.wav` (best-effort; falls back to first voice).
+  - Optional YAML mapping: create `voice_map.yaml` (or set `VIBEVOICE_VOICE_MAP=path/to/voice_map.yaml`) to alias names to existing samples, custom files, or whole directories that are scanned for audio files.
+    Example:
+
+    ```yaml
+    # voice_map.yaml
+    alloy: en-Frank_man        # map to scanned name
+    ash: demo/voices/en-Carter_man.wav  # map to explicit path
+    aliases:
+      shimmer: en-Alice_woman
+    directories:
+      - demo/custom_voices
+    ```
+  - SSE streaming: set `stream_format="sse"` to receive SSE events with base64-encoded PCM chunks.
+  - Absolute/relative file path also works: set `voice="path:/abs/or/relative.wav"` or just `voice="/abs/or/relative.wav"`.
+  - Data URL or base64 upload works via `extra_body`:
+
+```python
+voice_bytes = open("my_ref.wav","rb").read()
+import base64
+voice_b64 = base64.b64encode(voice_bytes).decode()
+
+speech = client.audio.speech.create(
+    model="vibevoice/VibeVoice-1.5B",
+    voice="Andrew",  # used only if no voice_data/voice_path are passed
+    input="Hello!",
+    response_format="mp3",
+    extra_body={
+        # either absolute/relative path
+        # "voice_path": "./my_ref.wav",
+        # or base64 (optionally as a data URL: f"data:audio/wav;base64,{voice_b64}")
+        "voice_data": voice_b64,
+    },
+)
+```
+
+- STT endpoints are not provided; only `audio.speech` is implemented.
+- Device: CUDA if available; override with `VIBEVOICE_DEVICE=cpu|cuda|mps`.
+- Local model path tips:
+  - If you pass a local `--model_path`, ensure all shards referenced by `model.safetensors.index.json` are present in that folder (e.g., `model-00001-of-00010.safetensors` ... `model-00010-of-00010.safetensors`). The server now validates these and returns a clear 400 error if any are missing.
+  - You can disable the shard pre-check by setting `VIBEVOICE_VALIDATE_SHARDS=0`. Note: if shards are truly missing, the underlying loader may still fail.
+
+Auth & Logging:
+- API key auth is disabled by default. To enable, set `VIBEVOICE_REQUIRE_API_KEY=1` and manage keys externally.
+- Logs are written to `logs/`:
+  - `requests.log` (JSONL; includes request id, prompt snippet if enabled)
+  - `hints.log` (JSONL; internal hints per request)
+  - Configure via env: `VIBEVOICE_LOG_DIR`, `VIBEVOICE_LOG_PROMPTS=1`, `VIBEVOICE_PROMPT_MAXLEN=4096`.
+- Admin API key management (requires `VIBEVOICE_ADMIN_TOKEN`):
+  1. Export a secret token before launching the server, e.g. `export VIBEVOICE_ADMIN_TOKEN="super-secret"`. If unset the admin routes return `403 admin_disabled`.
+  2. Call the admin endpoints (respecting your base path, `/v1` by default) with an `Authorization: Bearer $VIBEVOICE_ADMIN_TOKEN` header:
+
+     ```bash
+     # List stored key hashes
+     curl -sS -H "Authorization: Bearer $VIBEVOICE_ADMIN_TOKEN" \
+       http://127.0.0.1:8000/v1/admin/keys
+
+     # Create/import a key (omit the body to auto-generate with the given prefix)
+     curl -sS -X POST -H "Authorization: Bearer $VIBEVOICE_ADMIN_TOKEN" \
+       -H "Content-Type: application/json" \
+       -d '{"prefix": "sk-"}' \
+       http://127.0.0.1:8000/v1/admin/keys
+
+     # Revoke a key by its stored hash
+     curl -sS -X DELETE -H "Authorization: Bearer $VIBEVOICE_ADMIN_TOKEN" \
+       http://127.0.0.1:8000/v1/admin/keys/<key_hash>
+     ```
+
+  3. `GET` responds with `{"keys": [...], "count": N}`; `POST` returns the plaintext `key` (only shown once) plus its `hash` (SHA-256); `DELETE` returns `{"deleted": true, "hash": ...}` or a `404` for unknown hashes. You can supply an existing key with `{"key": "sk-..."}` or omit the body to let the server generate one (optionally customise the prefix).
+  4. These admin routes bypass the regular API-key middleware so you can manage keys even when `VIBEVOICE_REQUIRE_API_KEY=1`, but they are still observed/logged and reply with clear `401`/`403` errors if the admin bearer token is missing or incorrect.
+
+### JS SSE client (Node 18+)
+
+```bash
+node scripts/js/openai_sse_client.mjs \
+  --base http://127.0.0.1:8000 \
+  --model "F:/VibeVoice-Large" \
+  --voice Alice \
+  --text "Hello SSE" \
+  --out outputs/js_sse/out.wav
+```
+
+This client posts to `/audio/speech` with `stream_format="sse"`, parses SSE events, decodes base64 PCM chunks, and writes a WAV file.
+### Voice Mapping via YAML
+
+You can manage voice name aliases via a simple YAML file. The server loads it on each request:
+
+- Search order (first found):
+  1) `VIBEVOICE_VOICE_MAP` env var (relative to repo root or absolute)
+  2) `<repo>/voice_map.yaml`
+  3) `<repo>/config/voice_map.yaml`
+
+Copy the sample and edit:
+
+```bash
+cp config/voice_map.yaml.sample config/voice_map.yaml
+```
+
+Example mapping (aliases plus directory auto-discovery):
+
+```yaml
+# voice_map.yaml
+alloy: en-Frank_man
+ash: en-Carter_man
+
+aliases:
+  promo_female: demo/voices/en-Alice_woman.wav
+  win_custom: F:\\voices\\my_voice.wav
+
+directories:
+  - demo/custom_voices
+  - path: demo/more_voices
+    prefix: promo_
+    recursive: true
+```
+
+Then call with `voice="alloy"` (or any alias you created). Changes are picked up on next request.
+
+If you prefer an explicit path per request, keep using `extra_body.voice_path` or `extra_body.voice_data`.
+
+See also: `config/voice_map.yaml.sample` for a comprehensive example.
 
 ### 🚨 Tips
 
