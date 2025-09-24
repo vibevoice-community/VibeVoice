@@ -1,0 +1,231 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VibeVoice Streaming Console</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; }
+    label { display: block; margin: 8px 0 4px; }
+    input, textarea, select { width: 100%; max-width: 760px; padding: 6px; }
+    .row { margin-bottom: 12px; }
+    button { padding: 8px 12px; margin-right: 8px; }
+    #log, #headers { white-space: pre-wrap; background: #f6f8fa; padding: 8px; border-radius: 6px; max-width: 860px; }
+    audio { width: 100%; max-width: 760px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .sp-row input { max-width: 620px; }
+  </style>
+</head>
+<body>
+  <h1>VibeVoice Streaming Console</h1>
+  <div class="grid">
+    <div>
+      <div class="row"><label>Base URL</label><input id="base" value="http://127.0.0.1:8000" /></div>
+      <div class="row"><label>Model</label><input id="model" value="vibevoice/VibeVoice-1.5B" /></div>
+      <div class="row"><label>Mode</label>
+        <select id="mode">
+          <option value="sse">SSE (PCM)</option>
+          <option value="binary">Binary (mp3/flac/opus/aac)</option>
+        </select>
+      </div>
+      <div class="row" id="fmtRow"><label>Format (binary)</label>
+        <select id="format">
+          <option value="mp3">mp3</option>
+          <option value="aac">aac</option>
+          <option value="opus">opus (webm)</option>
+        </select>
+      </div>
+      <div class="row"><label>Voice</label>
+        <div>
+          <select id="voiceSelect" style="max-width:360px;"></select>
+          <input id="voice" placeholder="or type custom (overrides select)" style="max-width:360px; margin-left:8px;" />
+          <button id="refreshVoices">Refresh</button>
+        </div>
+      </div>
+      <div class="row"><label>Speakers (alias/path/dataURL per speaker)</label>
+        <div id="speakersBox"></div>
+        <button id="addSpeaker">Add Speaker</button>
+      </div>
+      <div class="row"><label>Text</label><textarea id="text" rows="4">Hello from VibeVoice streaming console!</textarea></div>
+      <div class="row"><label>Instructions</label><textarea id="instructions" rows="2"></textarea></div>
+      <div class="row"><label>Instructions Strategy</label>
+        <select id="instStrategy">
+          <option value="system_only" selected>system_only</option>
+          <option value="preprompt_only">preprompt_only</option>
+          <option value="system_and_preprompt">system_and_preprompt</option>
+        </select>
+      </div>
+      <div class="row"><label>Instructions Repeat</label><input id="instRepeat" type="number" step="1" value="1" /></div>
+      <div class="row"><label>Speed (0.25~4.0)</label><input id="speed" type="number" step="0.1" min="0.25" max="4.0" /></div>
+      <div class="row"><label>CFG scale</label><input id="cfg_scale" type="number" step="0.1" /></div>
+      <div class="row"><label>DDPM steps</label><input id="ddpm_steps" type="number" step="1" /></div>
+      <div class="row"><button id="start">Start</button> <button id="stop">Stop</button></div>
+    </div>
+    <div>
+      <div class="row"><audio id="player" controls></audio></div>
+      <div class="row"><div id="headers"></div></div>
+      <div class="row"><div id="log"></div></div>
+      <div class="row">
+        <h3>Effective Encoding Config</h3>
+        <pre id="cfgPanel"></pre>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const logEl = document.getElementById('log');
+    const hdrEl = document.getElementById('headers');
+    const audio = document.getElementById('player');
+    let controller = null;
+    let audioCtx = null; let playhead = 0; let sampleRate = 24000;
+
+    function log(msg) { logEl.textContent += msg + "\n"; logEl.scrollTop = logEl.scrollHeight; }
+
+    async function loadVoices() {
+      const base = document.getElementById('base').value.replace(/\/$/, '');
+      const url = base + '/voices/aliases';
+      const sel = document.getElementById('voiceSelect'); sel.innerHTML = '';
+      try {
+        const resp = await fetch(url);
+        const data = await resp.json();
+        const names = (data.aliases || []);
+        const def = ['Alice','Frank','Carter','Maya','Xinran','Bowen'];
+        const combined = Array.from(new Set([...def, ...names]));
+        for (const n of combined) { const opt = document.createElement('option'); opt.value = n; opt.textContent = n; sel.appendChild(opt); }
+      } catch (e) { log('Failed to load voices: ' + e); }
+    }
+
+    function pcm16ToFloat32(pcm) {
+      const view = new DataView(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+      const out = new Float32Array(pcm.byteLength / 2);
+      for (let i = 0; i < out.length; i++) out[i] = Math.max(-1, Math.min(1, view.getInt16(i*2, true)/32768));
+      return out;
+    }
+    function schedulePCM(floatData) {
+      if (!audioCtx) { audioCtx = new (window.AudioContext||window.webkitAudioContext)(); playhead = audioCtx.currentTime; }
+      const buf = audioCtx.createBuffer(1, floatData.length, sampleRate);
+      buf.copyToChannel(floatData, 0);
+      const src = audioCtx.createBufferSource(); src.buffer = buf; const when = Math.max(playhead, audioCtx.currentTime);
+      src.connect(audioCtx.destination); src.start(when); playhead = when + (floatData.length/sampleRate);
+    }
+
+    function setHeaders(resp) {
+      const rid = resp.headers.get('X-Request-ID')||''; const hints = resp.headers.get('X-Hints')||'';
+      const sr = resp.headers.get('X-Sample-Rate')||''; const xfmt = resp.headers.get('X-Stream-Format')||'';
+      const items = hints.split('|').map(s=>s.trim()).filter(Boolean);
+      let pretty = '';
+      for (const it of items) { pretty += `• ${it}\n`; }
+      hdrEl.textContent = `X-Request-ID: ${rid}\nX-Sample-Rate: ${sr}\nX-Stream-Format: ${xfmt}\n` + (pretty?`Hints:\n${pretty}`:'');
+    }
+
+    function collectSpeakers() {
+      const rows = document.querySelectorAll('.sp-row input'); const arr = [];
+      for (const r of rows) { const v = r.value.trim(); if (v) arr.push(v); }
+      return arr;
+    }
+
+    async function start() {
+      const base = document.getElementById('base').value.replace(/\/$/, '');
+      const url = base + '/audio/speech';
+      const model = document.getElementById('model').value;
+      const mode = document.getElementById('mode').value;
+      const fmt = document.getElementById('format').value;
+      const voiceSel = document.getElementById('voiceSelect').value;
+      const voiceInput = document.getElementById('voice').value; const voice = voiceInput || voiceSel || 'Alice';
+      const text = document.getElementById('text').value; const instructions = document.getElementById('instructions').value;
+      const strategy = document.getElementById('instStrategy').value; const instRep = parseInt(document.getElementById('instRepeat').value||'1',10);
+      const speedVal = document.getElementById('speed').value; const cfgScaleVal = document.getElementById('cfg_scale').value; const ddpmStepsVal = document.getElementById('ddpm_steps').value;
+      const speakers = collectSpeakers();
+
+      const body = { model, voice, input: text };
+      if (instructions) body.instructions = instructions;
+      if (strategy) body.instructions_strategy = strategy;
+      if (instRep) body.instructions_repeat = instRep;
+      if (speedVal) body.speed = parseFloat(speedVal);
+      if (cfgScaleVal) body.cfg_scale = parseFloat(cfgScaleVal);
+      if (ddpmStepsVal) body.ddpm_steps = parseInt(ddpmStepsVal,10);
+      if (speakers.length) body.speakers = speakers;
+
+      controller = new AbortController(); logEl.textContent=''; hdrEl.textContent=''; audio.src=''; audio.pause();
+
+      if (mode === 'sse') {
+        body.stream_format = 'sse';
+        const resp = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json','Accept':'text/event-stream'}, body: JSON.stringify(body), signal: controller.signal }).catch(e=>{log('Fetch err: '+e); return null;});
+        if (!resp || !resp.ok || !resp.body) { log('HTTP error: '+(resp?resp.status:'no response')); return; }
+        setHeaders(resp);
+        const reader = resp.body.getReader(); const decoder = new TextDecoder(); let buf='';
+        // For SSE playback via WebAudio
+        while (true) {
+          const {done, value} = await reader.read(); if (done) break; buf += decoder.decode(value,{stream:true});
+          let idx; while ((idx = buf.indexOf('\n\n')) !== -1) {
+            const block = buf.slice(0, idx); buf = buf.slice(idx+2);
+            let event='message', data='';
+            for (const line of block.split(/\r?\n/)) { if (line.startsWith('event:')) event=line.slice(6).trim(); else if (line.startsWith('data:')) data += line.slice(5).trim(); }
+            if (!data) continue;
+            try {
+              const payload = JSON.parse(data);
+              if (event==='start' && payload.sample_rate) { sampleRate = payload.sample_rate; log('SSE start sr='+sampleRate); }
+              else if (event==='chunk' && payload.type==='audio_chunk') { const b = atob(payload.data); const bytes=new Uint8Array(b.length); for (let i=0;i<b.length;i++) bytes[i]=b.charCodeAt(i); const f32=pcm16ToFloat32(bytes); schedulePCM(f32); }
+              else if (event==='error') { log('SSE error: '+data); }
+            } catch (e) {}
+          }
+        }
+      } else {
+        // Binary streaming (MSE if available)
+        body.stream_format = 'audio'; body.response_format = fmt;
+        const mime = fmt==='mp3' ? 'audio/mpeg' : (fmt==='aac' ? 'audio/aac' : 'audio/webm; codecs="opus"');
+        const useMSE = ('MediaSource' in window) && MediaSource.isTypeSupported(mime);
+        if (!useMSE) log('MSE not supported for '+mime+'; will fallback to blob playback');
+        if (useMSE) {
+          const mediaSource = new MediaSource(); audio.src = URL.createObjectURL(mediaSource);
+          mediaSource.addEventListener('sourceopen', async () => {
+            let sb; try { sb = mediaSource.addSourceBuffer(mime); } catch(e) { log('addSourceBuffer failed: '+e); mediaSource.endOfStream(); return; }
+            const resp = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body), signal: controller.signal }).catch(e=>{ log('Fetch error: '+e); return null; });
+            if (!resp || !resp.ok || !resp.body) { log('HTTP error: '+(resp?resp.status:'no response')); try{mediaSource.endOfStream();}catch{} return; }
+            setHeaders(resp);
+            const reader = resp.body.getReader();
+            async function pump(){ const {done, value} = await reader.read(); if (done){ try{mediaSource.endOfStream();}catch{} return; }
+              await new Promise((res,rej)=>{ const onUpdate=()=>{sb.removeEventListener('updateend',onUpdate); res();}; sb.addEventListener('updateend', onUpdate); try{ sb.appendBuffer(value.buffer);}catch(e){rej(e);} }).catch(e=>log('appendBuffer error: '+e)); pump(); }
+            pump(); audio.play().catch(()=>{});
+          });
+        } else {
+          // Fallback: read all then blob
+          const resp = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body), signal: controller.signal });
+          const buf = await resp.arrayBuffer(); setHeaders(resp); audio.src = URL.createObjectURL(new Blob([buf], {type:mime})); audio.play().catch(()=>{});
+        }
+      }
+    }
+
+    function stop(){ if (controller) controller.abort(); controller=null; try{ audio.pause(); }catch{} }
+
+    // UI events
+    document.getElementById('start').onclick = start; document.getElementById('stop').onclick = stop;
+    document.getElementById('refreshVoices').onclick = loadVoices;
+    document.getElementById('voiceSelect').onchange = ()=>{ document.getElementById('voice').value=''; };
+    // also link to first speaker row
+    document.getElementById('voiceSelect').addEventListener('change', ()=>{
+      const sel = document.getElementById('voiceSelect').value;
+      const first = document.querySelector('.sp-row input');
+      if (first && !first.value.trim()) first.value = sel;
+    });
+    document.getElementById('mode').onchange = ()=>{ document.getElementById('fmtRow').style.display = (document.getElementById('mode').value==='binary') ? '' : 'none'; };
+
+    function addSpeakerRow(initVal='') { const box=document.getElementById('speakersBox'); const row=document.createElement('div'); row.className='sp-row'; const inp=document.createElement('input'); inp.placeholder='alias/path/dataURL'; inp.value=initVal; const btn=document.createElement('button'); btn.textContent='Remove'; btn.onclick=()=>{ box.removeChild(row); }; row.appendChild(inp); row.appendChild(btn); box.appendChild(row); }
+    document.getElementById('addSpeaker').onclick = ()=> addSpeakerRow('');
+
+    // init
+    loadVoices(); addSpeakerRow(''); document.getElementById('fmtRow').style.display='none';
+    // fetch encoding config
+    (async ()=>{
+      try{
+        const base = document.getElementById('base').value.replace(/\/$/, '');
+        const resp = await fetch(base + '/config/ffmpeg');
+        if (resp.ok){
+          const cfg = await resp.json();
+          document.getElementById('cfgPanel').textContent = JSON.stringify(cfg, null, 2);
+        }
+      }catch(e){ /* ignore */ }
+    })();
+  </script>
+</body>
+</html>

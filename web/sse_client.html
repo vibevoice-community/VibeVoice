@@ -1,0 +1,297 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VibeVoice SSE Client</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; }
+    label { display: block; margin: 8px 0 4px; }
+    input, textarea, select { width: 100%; max-width: 720px; padding: 6px; }
+    .row { margin-bottom: 12px; }
+    button { padding: 8px 12px; margin-right: 8px; }
+    #log { white-space: pre-wrap; background: #f6f8fa; padding: 8px; border-radius: 6px; max-width: 820px; }
+  </style>
+</head>
+<body>
+  <h1>VibeVoice SSE Client (Browser)</h1>
+  <div class="row">
+    <label>Base URL</label>
+    <input id="base" value="http://127.0.0.1:8000" />
+  </div>
+  <div class="row">
+    <label>Model</label>
+    <input id="model" value="vibevoice/VibeVoice-1.5B" />
+  </div>
+  <div class="row">
+    <label>Voice</label>
+    <div>
+      <select id="voiceSelect" style="max-width:360px;"></select>
+      <input id="voice" placeholder="or type custom (overrides select)" style="max-width:360px; margin-left:8px;" />
+      <button id="refreshVoices">Refresh</button>
+    </div>
+  </div>
+  <div class="row">
+    <label>Text</label>
+    <textarea id="text" rows="3">Hello from VibeVoice SSE (browser client)!</textarea>
+  </div>
+  <div class="row">
+    <label>Instructions (optional)</label>
+    <textarea id="instructions" rows="2"></textarea>
+  </div>
+  <div class="row">
+    <label>Speakers (optional; alias/path/dataURL per speaker)</label>
+    <div id="speakersBox"></div>
+    <button id="addSpeaker">Add Speaker</button>
+  </div>
+  <div class="row">
+    <label>Speed (0.25~4.0, optional)</label>
+    <input id="speed" type="number" step="0.1" min="0.25" max="4.0" />
+  </div>
+  <div class="row">
+    <label>CFG scale (optional)</label>
+    <input id="cfg_scale" type="number" step="0.1" />
+  </div>
+  <div class="row">
+    <label>DDPM steps (optional)</label>
+    <input id="ddpm_steps" type="number" step="1" />
+  </div>
+  <div class="row">
+    <button id="start">Start Streaming</button>
+    <button id="stop">Stop</button>
+  </div>
+  <div class="row">
+    <div id="log"></div>
+    <h3>Effective Encoding Config</h3>
+    <pre id="cfgPanel"></pre>
+  </div>
+  <div class="row">
+    <div id="headers" style="white-space: pre-wrap; max-width: 820px;"></div>
+  </div>
+
+  <script>
+    const logEl = document.getElementById('log');
+    let controller = null;
+    let audioCtx = null;
+    let playhead = 0;
+    let sampleRate = 24000;
+
+    async function loadVoices() {
+      const base = document.getElementById('base').value.replace(/\/$/, '');
+      const url = base + '/voices/aliases';
+      const sel = document.getElementById('voiceSelect');
+      sel.innerHTML = '';
+      try {
+        const resp = await fetch(url);
+        const data = await resp.json();
+        const names = (data.aliases || []);
+        const def = ['Alice','Frank','Carter','Maya','Xinran','Bowen'];
+        const combined = Array.from(new Set([...def, ...names]));
+        for (const n of combined) {
+          const opt = document.createElement('option');
+          opt.value = n;
+          opt.textContent = n;
+          sel.appendChild(opt);
+        }
+      } catch (e) {
+        log('Failed to load voices: ' + e);
+      }
+    }
+
+    function log(msg) {
+      logEl.textContent += msg + "\n";
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function pcm16ToFloat32(pcm) {
+      const view = new DataView(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+      const out = new Float32Array(pcm.byteLength / 2);
+      for (let i = 0; i < out.length; i++) {
+        out[i] = Math.max(-1, Math.min(1, view.getInt16(i * 2, true) / 32768));
+      }
+      return out;
+    }
+
+    function scheduleChunk(floatData) {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        playhead = audioCtx.currentTime;
+      }
+      const length = floatData.length;
+      const buf = audioCtx.createBuffer(1, length, sampleRate);
+      buf.copyToChannel(floatData, 0);
+      const src = audioCtx.createBufferSource();
+      src.buffer = buf;
+      const when = Math.max(playhead, audioCtx.currentTime);
+      src.connect(audioCtx.destination);
+      src.start(when);
+      playhead = when + (length / sampleRate);
+    }
+
+    async function start() {
+      const base = document.getElementById('base').value.replace(/\/$/, '');
+      const url = base + '/audio/speech';
+      const model = document.getElementById('model').value;
+      const voiceSel = document.getElementById('voiceSelect').value;
+      const voiceInput = document.getElementById('voice').value;
+      const voice = voiceInput || voiceSel || 'Alice';
+      const text = document.getElementById('text').value;
+      const instructions = document.getElementById('instructions').value;
+      const speedVal = document.getElementById('speed').value;
+      const cfgScaleVal = document.getElementById('cfg_scale').value;
+      const ddpmStepsVal = document.getElementById('ddpm_steps').value;
+      const speed = speedVal ? parseFloat(speedVal) : null;
+
+      const body = { model, voice, input: text, stream_format: 'sse' };
+      if (instructions) body.instructions = instructions;
+      if (speed != null) body.speed = speed;
+      if (cfgScaleVal) body.cfg_scale = parseFloat(cfgScaleVal);
+      if (ddpmStepsVal) body.ddpm_steps = parseInt(ddpmStepsVal, 10);
+      // collect speakers rows
+      const rows = document.querySelectorAll('.sp-row input');
+      const arr = [];
+      for (const r of rows) {
+        const v = r.value.trim(); if (v) arr.push(v);
+      }
+      if (arr.length) body.speakers = arr;
+
+      controller = new AbortController();
+      logEl.textContent = '';
+      log('Connecting...');
+
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'text/event-stream',
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      }).catch(err => { log('Fetch error: ' + err); return null; });
+      if (!resp || !resp.ok || !resp.body) {
+        log('HTTP error: ' + (resp ? resp.status : 'no response'));
+        return;
+      }
+
+      // Show response headers (request id, hints, sample rate)
+      const hdr = document.getElementById('headers');
+      const rid = resp.headers.get('X-Request-ID') || '';
+      const hintsRaw = resp.headers.get('X-Hints') || '';
+      const sr = resp.headers.get('X-Sample-Rate') || '';
+      const xfmt = resp.headers.get('X-Stream-Format') || '';
+      // Parse hints for nicer display
+      const items = hintsRaw.split('|').map(s => s.trim()).filter(Boolean);
+      let pretty = '';
+      for (const it of items) {
+        if (it.startsWith('instructions_clamped:')) {
+          // e.g. instructions_clamped:orig=3500>max=2000
+          pretty += `• ${it}\n`;
+        } else if (it.startsWith('speed_clamp:')) {
+          pretty += `• ${it}\n`;
+        } else if (it.startsWith('ffmpeg_')) {
+          pretty += `• ${it}\n`;
+        } else if (it) {
+          pretty += `• ${it}\n`;
+        }
+      }
+      hdr.textContent = `X-Request-ID: ${rid}\nX-Sample-Rate: ${sr}\nX-Stream-Format: ${xfmt}\n` + (pretty ? `Hints:\n${pretty}` : '');
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      audioCtx = null; playhead = 0; sampleRate = 24000;
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buf.indexOf('\n\n')) !== -1) {
+            const block = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            let event = 'message';
+            let data = '';
+            for (const line of block.split(/\r?\n/)) {
+              if (line.startsWith('event:')) event = line.slice(6).trim();
+              else if (line.startsWith('data:')) data += line.slice(5).trim();
+            }
+            if (!data) continue;
+            try {
+              const payload = JSON.parse(data);
+              if (event === 'start' && payload.sample_rate) {
+                sampleRate = payload.sample_rate;
+                log('SSE start: sample_rate=' + sampleRate);
+              } else if (event === 'chunk' && payload.type === 'audio_chunk') {
+                const b = atob(payload.data);
+                const bytes = new Uint8Array(b.length);
+                for (let i = 0; i < b.length; i++) bytes[i] = b.charCodeAt(i);
+                const f32 = pcm16ToFloat32(bytes);
+                scheduleChunk(f32);
+                log('.');
+              } else if (event === 'error') {
+                log('SSE error: ' + JSON.stringify(payload));
+              } else if (event === 'end') {
+                log('SSE end');
+              }
+            } catch (e) {
+              // ignore parse errors
+            }
+          }
+        }
+      } catch (e) {
+        log('Stream error: ' + e);
+      }
+    }
+
+    function stop() {
+      if (controller) controller.abort();
+      controller = null;
+      if (audioCtx) {
+        try { audioCtx.close(); } catch {}
+        audioCtx = null;
+      }
+      log('Stopped.');
+    }
+
+    document.getElementById('start').onclick = start;
+    document.getElementById('stop').onclick = stop;
+    document.getElementById('refreshVoices').onclick = loadVoices;
+    document.getElementById('voiceSelect').onchange = () => {
+      // Clear manual input if user picks from list
+      document.getElementById('voice').value = '';
+      // Auto-fill first speaker row if empty
+      const sel = document.getElementById('voiceSelect').value;
+      const first = document.querySelector('.sp-row input');
+      if (first && !first.value.trim()) first.value = sel;
+    };
+
+    // speakers UI
+    function addSpeakerRow(initVal='') {
+      const box = document.getElementById('speakersBox');
+      const row = document.createElement('div');
+      row.className = 'sp-row';
+      const inp = document.createElement('input');
+      inp.placeholder = 'alias/path/dataURL'; inp.style.maxWidth = '640px'; inp.value = initVal;
+      const btn = document.createElement('button'); btn.textContent = 'Remove'; btn.onclick = ()=>{ box.removeChild(row); };
+      row.appendChild(inp); row.appendChild(btn); box.appendChild(row);
+    }
+    document.getElementById('addSpeaker').onclick = () => addSpeakerRow('');
+
+    // initial
+    loadVoices();
+    addSpeakerRow('');
+    // fetch encoding config
+    (async ()=>{
+      try{
+        const base = document.getElementById('base').value.replace(/\/$/, '');
+        const resp = await fetch(base + '/config/ffmpeg');
+        if (resp.ok){
+          const cfg = await resp.json();
+          document.getElementById('cfgPanel').textContent = JSON.stringify(cfg, null, 2);
+        }
+      }catch(e){}
+    })();
+  </script>
+</body>
+</html>

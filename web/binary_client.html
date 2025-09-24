@@ -1,0 +1,132 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VibeVoice Binary Streaming Client</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; }
+    label { display: block; margin: 8px 0 4px; }
+    input, textarea, select { width: 100%; max-width: 720px; padding: 6px; }
+    .row { margin-bottom: 12px; }
+    button { padding: 8px 12px; margin-right: 8px; }
+    #log { white-space: pre-wrap; background: #f6f8fa; padding: 8px; border-radius: 6px; max-width: 820px; }
+    audio { width: 100%; max-width: 720px; }
+  </style>
+</head>
+<body>
+  <h1>VibeVoice Binary Streaming Client (mp3/flac/opus/aac)</h1>
+  <p>Note: Browser MSE support varies by codec. mp3 generally works on Chromium-based browsers.</p>
+  <div class="row"><label>Base URL</label><input id="base" value="http://127.0.0.1:8000" /></div>
+  <div class="row"><label>Model</label><input id="model" value="vibevoice/VibeVoice-1.5B" /></div>
+  <div class="row"><label>Voice</label><input id="voice" value="Alice" /></div>
+  <div class="row"><label>Text</label><textarea id="text" rows="3">Hello (binary streaming)!</textarea></div>
+  <div class="row"><label>Instructions</label><textarea id="instructions" rows="2"></textarea></div>
+  <div class="row"><label>Format</label>
+    <select id="format">
+      <option value="mp3">mp3</option>
+      <option value="flac">flac</option>
+      <option value="opus">opus</option>
+      <option value="aac">aac</option>
+    </select>
+  </div>
+  <div class="row"><label>CFG scale</label><input id="cfg_scale" type="number" step="0.1" /></div>
+  <div class="row"><label>DDPM steps</label><input id="ddpm_steps" type="number" step="1" /></div>
+  <div class="row"><button id="start">Start</button> <button id="stop">Stop</button></div>
+  <div class="row"><audio id="player" controls></audio></div>
+  <div class="row"><div id="log"></div></div>
+
+  <script>
+    let controller = null;
+    const logEl = document.getElementById('log');
+    const audio = document.getElementById('player');
+
+    function log(msg) {
+      logEl.textContent += msg + "\n";
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    async function start() {
+      const base = document.getElementById('base').value.replace(/\/$/, '');
+      const url = base + '/audio/speech';
+      const model = document.getElementById('model').value;
+      const voice = document.getElementById('voice').value;
+      const text = document.getElementById('text').value;
+      const instructions = document.getElementById('instructions').value;
+      const fmt = document.getElementById('format').value;
+      const cfgScaleVal = document.getElementById('cfg_scale').value;
+      const ddpmStepsVal = document.getElementById('ddpm_steps').value;
+
+      const body = { model, voice, input: text, response_format: fmt, stream_format: 'audio' };
+      if (instructions) body.instructions = instructions;
+      if (cfgScaleVal) body.cfg_scale = parseFloat(cfgScaleVal);
+      if (ddpmStepsVal) body.ddpm_steps = parseInt(ddpmStepsVal, 10);
+
+      controller = new AbortController();
+      logEl.textContent = '';
+      log('Connecting...');
+
+      const mediaSource = new MediaSource();
+      audio.src = URL.createObjectURL(mediaSource);
+      let sourceBuffer;
+      const mime = fmt === 'mp3' ? 'audio/mpeg' : (fmt === 'aac' ? 'audio/aac' : 'audio/ogg');
+
+      mediaSource.addEventListener('sourceopen', async () => {
+        try {
+          sourceBuffer = mediaSource.addSourceBuffer(mime);
+        } catch (e) {
+          log('MSE addSourceBuffer failed: ' + e);
+          URL.revokeObjectURL(audio.src);
+          // Fallback: buffer whole response then set as blob (not true streaming)
+          const resp = await fetch(url, {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body), signal: controller.signal,
+          });
+          const buf = await resp.arrayBuffer();
+          audio.src = URL.createObjectURL(new Blob([buf], { type: mime }));
+          audio.play();
+          return;
+        }
+
+        const resp = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        }).catch(err => { log('Fetch error: ' + err); return null; });
+        if (!resp || !resp.ok || !resp.body) {
+          log('HTTP error: ' + (resp ? resp.status : 'no response'));
+          mediaSource.endOfStream();
+          return;
+        }
+        const reader = resp.body.getReader();
+        async function pump() {
+          const { done, value } = await reader.read();
+          if (done) {
+            try { mediaSource.endOfStream(); } catch {}
+            return;
+          }
+          // Append to SourceBuffer; handle updating state
+          await new Promise((resolve, reject) => {
+            const onUpdate = () => { sourceBuffer.removeEventListener('updateend', onUpdate); resolve(); };
+            sourceBuffer.addEventListener('updateend', onUpdate);
+            try { sourceBuffer.appendBuffer(value.buffer); } catch (e) { reject(e); }
+          }).catch(e => log('appendBuffer error: ' + e));
+          pump();
+        }
+        pump();
+      });
+      audio.play().catch(()=>{});
+    }
+
+    function stop() {
+      if (controller) controller.abort();
+      controller = null;
+      try { audio.pause(); } catch {}
+    }
+
+    document.getElementById('start').onclick = start;
+    document.getElementById('stop').onclick = stop;
+  </script>
+</body>
+</html>
+
