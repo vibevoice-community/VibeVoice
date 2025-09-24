@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import List, Dict, Any, Iterator
+from typing import List, Dict, Any, Iterator, Optional
 from datetime import datetime
 import threading
 import numpy as np
@@ -22,6 +22,7 @@ import traceback
 
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
+from vibevoice.modular.lora_loading import load_lora_assets
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 from vibevoice.modular.streamer import AudioStreamer
 from transformers.utils import logging
@@ -32,11 +33,12 @@ logger = logging.get_logger(__name__)
 
 
 class VibeVoiceDemo:
-    def __init__(self, model_path: str, device: str = "cuda", inference_steps: int = 5):
+    def __init__(self, model_path: str, device: str = "cuda", inference_steps: int = 5, adapter_path: Optional[str] = None):
         """Initialize the VibeVoice demo with model loading."""
         self.model_path = model_path
         self.device = device
         self.inference_steps = inference_steps
+        self.adapter_path = adapter_path
         self.is_generating = False  # Track generation state
         self.stop_generation = False  # Flag to stop generation
         self.current_streamer = None  # Track current audio streamer
@@ -108,6 +110,24 @@ class VibeVoiceDemo:
                     self.model.to("mps")
             else:
                 raise e
+        if self.adapter_path:
+            print(f"Loading fine-tuned assets from {self.adapter_path}")
+            report = load_lora_assets(self.model, self.adapter_path)
+            loaded_components = [
+                name for name, loaded in (
+                    ("language LoRA", report.language_model),
+                    ("diffusion head LoRA", report.diffusion_head_lora),
+                    ("diffusion head weights", report.diffusion_head_full),
+                    ("acoustic connector", report.acoustic_connector),
+                    ("semantic connector", report.semantic_connector),
+                )
+                if loaded
+            ]
+            if loaded_components:
+                print(f"Loaded components: {', '.join(loaded_components)}")
+            else:
+                print("Warning: no adapter components were loaded; check the checkpoint path.")
+
         self.model.eval()
         
         # Use SDE solver by default
@@ -1195,6 +1215,12 @@ def parse_args():
         default=7860,
         help="Port to run the demo on",
     )
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        default=None,
+        help="Path to a fine-tuned checkpoint directory containing LoRA adapters (optional)",
+    )
     
     return parser.parse_args()
 
@@ -1211,7 +1237,8 @@ def main():
     demo_instance = VibeVoiceDemo(
         model_path=args.model_path,
         device=args.device,
-        inference_steps=args.inference_steps
+        inference_steps=args.inference_steps,
+        adapter_path=args.checkpoint_path,
     )
     
     # Create interface

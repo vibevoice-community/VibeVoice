@@ -7,6 +7,7 @@ import time
 import torch
 
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
+from vibevoice.modular.lora_loading import load_lora_assets
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 from transformers.utils import logging
 
@@ -171,6 +172,12 @@ def parse_args():
         help="Device for inference: cuda | mps | cpu",
     )
     parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        default=None,
+        help="Path to a fine-tuned checkpoint directory containing LoRA adapters (optional)",
+    )
+    parser.add_argument(
         "--cfg_scale",
         type=float,
         default=1.3,
@@ -308,6 +315,28 @@ def main():
         else:
             raise e
 
+
+    if args.checkpoint_path:
+        print(f"Loading fine-tuned assets from {args.checkpoint_path}")
+        try:
+            report = load_lora_assets(model, args.checkpoint_path)
+            loaded_components = [
+                name for name, loaded in (
+                    ("language LoRA", report.language_model),
+                    ("diffusion head LoRA", report.diffusion_head_lora),
+                    ("diffusion head weights", report.diffusion_head_full),
+                    ("acoustic connector", report.acoustic_connector),
+                    ("semantic connector", report.semantic_connector),
+                )
+                if loaded
+            ]
+            if loaded_components:
+                print(f"Loaded components: {', '.join(loaded_components)}")
+            else:
+                print("Warning: no adapter components were loaded; check the checkpoint path.")
+        except Exception as exc:
+            print(f"Failed to load LoRA assets: {exc}")
+            raise
 
     model.eval()
     model.set_ddpm_inference_steps(num_steps=10)
