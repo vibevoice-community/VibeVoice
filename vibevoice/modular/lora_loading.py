@@ -23,6 +23,7 @@ class _LoadReport:
     diffusion_head_full: bool = False
     acoustic_connector: bool = False
     semantic_connector: bool = False
+    adapter_root: Optional[Path] = None
 
 
 class _DiffusionHeadForwardShim(nn.Module):
@@ -152,7 +153,7 @@ def load_lora_assets(model, checkpoint_dir: str, device: Optional[torch.device] 
         raise FileNotFoundError(f"Adapter directory not found: {adapter_root}")
 
     inferred_device = device or next(model.parameters()).device
-    report = _LoadReport()
+    report = _LoadReport(adapter_root=adapter_root)
 
     _load_language_model(model, adapter_root, inferred_device, report)
     _load_diffusion_head(model, adapter_root, inferred_device, report)
@@ -171,4 +172,3 @@ def load_lora_assets(model, checkpoint_dir: str, device: Optional[torch.device] 
         )
 
     return report
-

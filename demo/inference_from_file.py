@@ -178,6 +178,11 @@ def parse_args():
         help="Path to a fine-tuned checkpoint directory containing LoRA adapters (optional)",
     )
     parser.add_argument(
+        "--disable_prefill",
+        action="store_true",
+        help="Disable speech prefill (voice cloning) by setting is_prefill=False during generation",
+    )
+    parser.add_argument(
         "--cfg_scale",
         type=float,
         default=1.3,
@@ -334,9 +339,16 @@ def main():
                 print(f"Loaded components: {', '.join(loaded_components)}")
             else:
                 print("Warning: no adapter components were loaded; check the checkpoint path.")
+            if report.adapter_root is not None:
+                print(f"Adapter assets resolved to: {report.adapter_root}")
         except Exception as exc:
             print(f"Failed to load LoRA assets: {exc}")
             raise
+
+    if args.disable_prefill:
+        print("Voice cloning disabled: running generation with is_prefill=False")
+    else:
+        print("Voice cloning enabled: running generation with is_prefill=True")
 
     model.eval()
     model.set_ddpm_inference_steps(num_steps=10)
@@ -370,6 +382,7 @@ def main():
         tokenizer=processor.tokenizer,
         generation_config={'do_sample': False},
         verbose=True,
+        is_prefill=not args.disable_prefill,
     )
     generation_time = time.time() - start_time
     print(f"Generation time: {generation_time:.2f} seconds")

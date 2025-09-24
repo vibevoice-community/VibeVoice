@@ -39,6 +39,7 @@ class VibeVoiceDemo:
         self.device = device
         self.inference_steps = inference_steps
         self.adapter_path = adapter_path
+        self.loaded_adapter_root: Optional[str] = None
         self.is_generating = False  # Track generation state
         self.stop_generation = False  # Flag to stop generation
         self.current_streamer = None  # Track current audio streamer
@@ -49,6 +50,7 @@ class VibeVoiceDemo:
     def load_model(self):
         """Load the VibeVoice model and processor."""
         print(f"Loading processor & model from {self.model_path}")
+        self.loaded_adapter_root = None
         # Normalize potential 'mpx'
         if self.device.lower() == "mpx":
             print("Note: device 'mpx' detected, treating it as 'mps'.")
@@ -127,6 +129,11 @@ class VibeVoiceDemo:
                 print(f"Loaded components: {', '.join(loaded_components)}")
             else:
                 print("Warning: no adapter components were loaded; check the checkpoint path.")
+            if report.adapter_root is not None:
+                self.loaded_adapter_root = str(report.adapter_root)
+                print(f"Adapter assets resolved to: {self.loaded_adapter_root}")
+            else:
+                self.loaded_adapter_root = self.adapter_path
 
         self.model.eval()
         
@@ -202,7 +209,8 @@ class VibeVoiceDemo:
                                  speaker_2: str = None,
                                  speaker_3: str = None,
                                  speaker_4: str = None,
-                                 cfg_scale: float = 1.3) -> Iterator[tuple]:
+                                 cfg_scale: float = 1.3,
+                                 disable_voice_cloning: bool = False) -> Iterator[tuple]:
         try:
             
             # Reset stop flag and set generating state
@@ -230,10 +238,15 @@ class VibeVoiceDemo:
                     self.is_generating = False
                     raise gr.Error(f"Error: Please select a valid speaker for Speaker {i+1}.")
             
+            voice_cloning_enabled = not disable_voice_cloning
+
             # Build initial log
             log = f"🎙️ Generating podcast with {num_speakers} speakers\n"
             log += f"📊 Parameters: CFG Scale={cfg_scale}, Inference Steps={self.inference_steps}\n"
             log += f"🎭 Speakers: {', '.join(selected_speakers)}\n"
+            log += f"🔊 Voice cloning: {'Enabled' if voice_cloning_enabled else 'Disabled'}\n"
+            if self.loaded_adapter_root:
+                log += f"🧩 LoRA: {self.loaded_adapter_root}\n"
             
             # Check for stop signal
             if self.stop_generation:
@@ -241,15 +254,17 @@ class VibeVoiceDemo:
                 yield None, "🛑 Generation stopped by user", gr.update(visible=False)
                 return
             
-            # Load voice samples
-            voice_samples = []
-            for speaker_name in selected_speakers:
-                audio_path = self.available_voices[speaker_name]
-                audio_data = self.read_audio(audio_path)
-                if len(audio_data) == 0:
-                    self.is_generating = False
-                    raise gr.Error(f"Error: Failed to load audio for {speaker_name}")
-                voice_samples.append(audio_data)
+            # Load voice samples when voice cloning is enabled
+            voice_samples = None
+            if voice_cloning_enabled:
+                voice_samples = []
+                for speaker_name in selected_speakers:
+                    audio_path = self.available_voices[speaker_name]
+                    audio_data = self.read_audio(audio_path)
+                    if len(audio_data) == 0:
+                        self.is_generating = False
+                        raise gr.Error(f"Error: Failed to load audio for {speaker_name}")
+                    voice_samples.append(audio_data)
             
             # log += f"✅ Loaded {len(voice_samples)} voice samples\n"
             
@@ -288,13 +303,15 @@ class VibeVoiceDemo:
             
             start_time = time.time()
             
-            inputs = self.processor(
-                text=[formatted_script],
-                voice_samples=[voice_samples],
-                padding=True,
-                return_tensors="pt",
-                return_attention_mask=True,
-            )
+            processor_kwargs = {
+                "text": [formatted_script],
+                "padding": True,
+                "return_tensors": "pt",
+                "return_attention_mask": True,
+            }
+            processor_kwargs["voice_samples"] = [voice_samples] if voice_samples is not None else None
+
+            inputs = self.processor(**processor_kwargs)
             # Move tensors to device
             target_device = self.device if self.device in ("cuda", "mps") else "cpu"
             for k, v in inputs.items():
@@ -314,7 +331,7 @@ class VibeVoiceDemo:
             # Start generation in a separate thread
             generation_thread = threading.Thread(
                 target=self._generate_with_streamer,
-                args=(inputs, cfg_scale, audio_streamer)
+                args=(inputs, cfg_scale, audio_streamer, voice_cloning_enabled)
             )
             generation_thread.start()
             
@@ -496,7 +513,7 @@ class VibeVoiceDemo:
             traceback.print_exc()
             yield None, None, error_msg, gr.update(visible=False)
     
-    def _generate_with_streamer(self, inputs, cfg_scale, audio_streamer):
+    def _generate_with_streamer(self, inputs, cfg_scale, audio_streamer, voice_cloning_enabled: bool):
         """Helper method to run generation with streamer in a separate thread."""
         try:
             # Check for stop signal before starting generation
@@ -520,6 +537,7 @@ class VibeVoiceDemo:
                 stop_check_fn=check_stop_generation,  # Pass the stop check function
                 verbose=False,  # Disable verbose in streaming mode
                 refresh_negative=True,
+                is_prefill=voice_cloning_enabled,
             )
             
         except Exception as e:
@@ -886,6 +904,11 @@ def create_demo_interface(demo_instance: VibeVoiceDemo):
                         # info="Higher values increase adherence to text",
                         elem_classes="slider-container"
                     )
+                    disable_voice_cloning = gr.Checkbox(
+                        value=False,
+                        label="Disable voice cloning (skip conditioning voice prompts)",
+                        info="When enabled, sets is_prefill=False so the model ignores provided speaker audio."
+                    )
                 
             # Right column - Generation
             with gr.Column(scale=2, elem_classes="generation-card"):
@@ -1004,19 +1027,17 @@ Or paste text directly and it will auto-assign speakers.""",
         )
         
         # Main generation function with streaming
-        def generate_podcast_wrapper(num_speakers, script, *speakers_and_params):
+        def generate_podcast_wrapper(num_speakers, script, speaker_1, speaker_2, speaker_3, speaker_4, cfg_scale, disable_voice_cloning):
             """Wrapper function to handle the streaming generation call."""
             try:
-                # Extract speakers and parameters
-                speakers = speakers_and_params[:4]  # First 4 are speaker selections
-                cfg_scale = speakers_and_params[4]   # CFG scale
-                
+                speakers = [speaker_1, speaker_2, speaker_3, speaker_4]
+
                 # Clear outputs and reset visibility at start
                 yield None, gr.update(value=None, visible=False), "🎙️ Starting generation...", gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)
-                
+
                 # The generator will yield multiple times
                 final_log = "Starting generation..."
-                
+
                 for streaming_audio, complete_audio, log, streaming_visible in demo_instance.generate_podcast_streaming(
                     num_speakers=int(num_speakers),
                     script=script,
@@ -1024,7 +1045,8 @@ Or paste text directly and it will auto-assign speakers.""",
                     speaker_2=speakers[1],
                     speaker_3=speakers[2],
                     speaker_4=speakers[3],
-                    cfg_scale=cfg_scale
+                    cfg_scale=cfg_scale,
+                    disable_voice_cloning=disable_voice_cloning
                 ):
                     final_log = log
                     
@@ -1072,7 +1094,7 @@ Or paste text directly and it will auto-assign speakers.""",
             queue=False
         ).then(
             fn=generate_podcast_wrapper,
-            inputs=[num_speakers, script_input] + speaker_selections + [cfg_scale],
+            inputs=[num_speakers, script_input] + speaker_selections + [cfg_scale, disable_voice_cloning],
             outputs=[audio_output, complete_audio_output, log_output, streaming_status, generate_btn, stop_btn],
             queue=True  # Enable Gradio's built-in queue
         )

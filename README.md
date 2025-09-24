@@ -79,6 +79,7 @@ We'd like to thank [PsiPi](https://huggingface.co/PsiPi) for sharing an interest
 python demo/gradio_demo.py --model_path vibevoice/VibeVoice-1.5B --share
 # or python demo/gradio_demo.py --model_path vibevoice/VibeVoice-7B --share
 # optionally add --checkpoint_path path/to/checkpoint to load a fine-tuned adapter
+# use the in-app "Disable voice cloning" setting (Advanced Settings) to skip speaker conditioning
 ```
 
 **Option 2: Inference from files directly**
@@ -93,6 +94,9 @@ python demo/inference_from_file.py --model_path vibevoice/VibeVoice-7B --txt_pat
 
 # load a fine-tuned LoRA checkpoint
 python demo/inference_from_file.py --model_path vibevoice/VibeVoice-7B --txt_path demo/text_examples/1p_abs.txt --speaker_names Alice --checkpoint_path path/to/checkpoint
+
+# disable voice cloning (skip speech prefill)
+python demo/inference_from_file.py --model_path vibevoice/VibeVoice-7B --txt_path demo/text_examples/1p_abs.txt --speaker_names Alice --disable_prefill
 ```
 
 
