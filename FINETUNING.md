@@ -1,27 +1,51 @@
 # Finetuning
 
-More instructions coming soon.
+**NOTE: This document is still a work in progress.**
 
-VibeVoice finetuning works wonders - both for adaptipng VibeVoice to new languages and for better voice cloning of a single voice.
+VibeVoice finetuning is relatively straightforward and highly effective. You can finetune on either single speaker or multi-speaker data.
 
-Join the [Discord](https://discord.gg/ZDEYTTRxWG) for support. Also take a look at [voicepowered-ai/VibeVoice-finetuning](https://github.com/voicepowered-ai/VibeVoice-finetuning).
+Finetuning can be used to train a new speaker/voice or adapt VibeVoice to a new language. LoRA finetuning yields excellent results - even on small datasets.
 
-## Notes
+## Before you start
 
-* Members of the community have observed that for fine-tuning VibeVoice on a SINGLE voice, it is often beneficial to set `voice_prompt_drop_rate` to `1.0` and avoid use of voice cloning/reference audio all together during inference. This can lead to more natural speech generation. **If you are training on a single speaker I highly recommend you try this, just a note that if you do this voice cloning will not be supported on your finetuned model**
+If you run into any issues during the finetuning process, feel free to join the [Discord](https://discord.gg/ZDEYTTRxWG) for support.
 
-## Example Script
+Before you start, you will need:
 
-Example script:
+- Python, CUDA, and PyTorch installed
+- A GPU with at least 16 GB of VRAM
+- A dataset of audio recordings (preferably with at least 1 hour of audio, optimally 5+ hours)
+
+## Getting started
+
+Clone the VibeVoice repository:
+
+```bash
+git clone https://github.com/vibevoice-community/VibeVoice.git
+cd VibeVoice/
+```
+
+Install the dependencies:
+
+```bash
+pip install uv
+uv pip install -e .
+```
+
+## Finetune the model
+
+**IMPORTANT: For single-speaker datasets:** When working with data from only one speaker, you'll need to choose whether to maintain voice cloning functionality in your finetuned model. For single-speaker training, consider setting `voice_prompt_drop_rate` to `1.0`, which disables voice cloning entirely. Many users have found that removing voice cloning constraints allows the model to be more expressive and natural, as it eliminates unnecessary limitations on the model's output capabilities.
+
+Run the following command to finetune the model:
 
 ```bash
 python -m vibevoice.finetune.train_vibevoice \
     --model_name_or_path vibevoice/VibeVoice-1.5B \
-    --dataset_name vibevoice/jenny_vibevoice_formatted \
+    --dataset_name [PATH_TO_YOUR_DATASET] \
     --text_column_name text \
     --audio_column_name audio \
     --voice_prompts_column_name audio \
-    --output_dir finetune_vibevoice_zac \
+    --output_dir [PATH_TO_SAVE_YOUR_FINETUNED_MODEL] \
     --per_device_train_batch_size 8 \
     --gradient_accumulation_steps 16 \
     --learning_rate 2.5e-5 \
@@ -53,3 +77,8 @@ python -m vibevoice.finetune.train_vibevoice \
 - The `voice_prompts_column_name` parameter is currently set to `audio` in the example above, which means the same audio file is used for both training data and voice prompts. This is appropriate when you don't have separate voice prompt files. However, if your dataset includes dedicated voice prompt files (short audio clips that capture the target speaker's voice characteristics), you should specify a different column name that contains these separate voice prompt files. For podcast-style training (once it is supported), the model typically uses the first utterance from each speaker within the podcast episode as the voice prompt, meaning the voice prompt is extracted from the beginning of the same audio file used for training.
 - The dataset text/transcript must be in the format of "Speaker X: text", even if there is only one speaker. Example: `Speaker 1: Hello, how are you?`
 - The default dataset is the Jenny (Dioco) dataset. This is a small dataset for testing purposes and each segment is only a few seconds long. The model may struggle to generate long audio with this dataset.
+
+## Credits
+
+- Thanks to [VoicePowered AI](https://github.com/voicepowered-ai/VibeVoice-finetuning) for the original finetuning implementation.
+- Thanks to members of the community for discovering that setting `voice_prompt_drop_rate` to `1.0` can lead to more natural speech generation.
