@@ -188,7 +188,12 @@ def parse_args():
         default=1.3,
         help="CFG (Classifier-Free Guidance) scale for generation (default: 1.3)",
     )
-    
+    parser.add_argument(
+    "--seed",
+    type=int,
+    default=None,
+    help="Random seed for reproducibility (optional)",
+)
     return parser.parse_args()
 
 def main():
@@ -205,6 +210,12 @@ def main():
         args.device = "cpu"
 
     print(f"Using device: {args.device}")
+
+    if args.seed is not None:
+        print(f"Setting seed: {args.seed}")
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
 
     # Initialize voice mapper
     voice_mapper = VoiceMapper()
@@ -435,7 +446,9 @@ def main():
     print(f"Generation time: {generation_time:.2f} seconds")
     print(f"Audio duration: {audio_duration:.2f} seconds")
     print(f"RTF (Real Time Factor): {rtf:.2f}x")
-    
+    if args.seed is not None:
+        print(f"Seed used: {args.seed}")
+
     print("="*50)
 
 if __name__ == "__main__":
