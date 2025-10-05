@@ -57,7 +57,7 @@ class VibeVoiceDataset:
         data["audio"] = item[self.audio_column]
 
         # Fix speaker lines
-        if not re.search(r"^Speaker\s*\d+:\s*", text, re.MULTILINE):
+        if not re.search(r"^Speaker\s*\d+:\s*", data["text"], re.MULTILINE):
             data["text"] = "\n".join(
                 [f"Speaker 0: {line.strip()}" for line in data["text"].splitlines() if line.strip()]
             )
