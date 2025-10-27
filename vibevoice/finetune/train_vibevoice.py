@@ -7,20 +7,25 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from datasets import load_dataset, DatasetDict, VerificationMode
+from torch.utils.data import DataLoader
+from datasets import load_dataset, VerificationMode
 
 from transformers import (
     HfArgumentParser,
-    Trainer,
     set_seed,
     TrainerCallback,
 )
 from transformers import TrainingArguments as HfTrainingArguments
+from transformers.optimization import get_scheduler
+
+from accelerate import Accelerator
 
 from peft import LoraConfig, get_peft_model, TaskType
 
-from vibevoice.modular.modeling_vibevoice import VibeVoiceForConditionalGeneration
-from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
+from vibevoice.modular.modeling_vibevoice import (
+    VibeVoiceForConditionalGeneration,
+    VibeVoiceCausalLMOutputWithPast,
+)
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 
 from vibevoice.finetune.data_vibevoice import VibeVoiceDataset, VibeVoiceCollator
@@ -32,6 +37,10 @@ logger = logging.getLogger(__name__)
 import copy
 import torch
 from transformers import TrainerCallback
+import math
+from torch.optim import AdamW
+from tqdm.auto import tqdm
+from transformers.trainer_utils import IntervalStrategy
 
 class EmaCallback(TrainerCallback):
     def __init__(self, attr_path="model.prediction_head", decay=0.999, device="cpu"):
@@ -602,392 +611,474 @@ def main() -> None:
             except Exception as e:
                 logger.warning(f"LoRA debug (on_step_end) failed: {e}")
 
-    class VibeVoiceTrainer(Trainer):
-        def training_forward(self, model: VibeVoiceForConditionalGeneration, inputs: Dict[str, Any]):
-            """Custom forward pass for training with new diffusion loss calculation."""
-            # Extract inputs
-            input_ids = inputs.get("input_ids")
-            attention_mask = inputs.get("attention_mask")
-            position_ids = inputs.get("position_ids")
-            past_key_values = inputs.get("past_key_values")
-            inputs_embeds = inputs.get("inputs_embeds")
-            use_cache = inputs.get("use_cache", False)
-            output_attentions = inputs.get("output_attentions")
-            output_hidden_states = inputs.get("output_hidden_states")
-            return_dict = inputs.get("return_dict", True)
-            cache_position = inputs.get("cache_position")
-            
-            # Speech-related inputs
-            speech_tensors = inputs.get("speech_tensors")
-            speech_masks = inputs.get("speech_masks")
-            speeches_loss_input = inputs.get("speeches_loss_input")
-            speech_semantic_tensors = inputs.get("speech_semantic_tensors")
-            acoustic_input_mask = inputs.get("acoustic_input_mask")
-            acoustic_loss_mask = inputs.get("acoustic_loss_mask")
-            ddmp_batch_mul = training_args.ddpm_batch_mul
-            kwargs = {}
-            
-            # --- START: Copy of model forward logic with new diffusion loss ---
-            x = model.get_input_embeddings()(input_ids)
+    class _SimpleState:
+        def __init__(self) -> None:
+            self.global_step: int = 0
 
-            semantic_speech_all_connect_features = model.model.semantic_connector(speech_semantic_tensors)
-            if speeches_loss_input is not None:
-                # only part audio need diffuse
-                speech_all_features, speech_all_connect_features = model.forward_speech_features(
-                        speech_tensors=speech_tensors.type_as(x) if speech_tensors is not None else None,
-                        speech_masks=speech_masks,
-                        speech_type=kwargs.get("speech_type", "audio"),
-                        return_unmask=True
-                    )
-                if speech_tensors is not None:
-                    if semantic_speech_all_connect_features is not None:
-                        x[acoustic_input_mask] = speech_all_connect_features[speech_masks] + semantic_speech_all_connect_features[speech_masks]
-                    else:
-                        x[acoustic_input_mask] = speech_all_connect_features[speech_masks]
-                    speech_features = speech_all_features[speeches_loss_input & speech_masks] # only part audio need diffuse
-                    speech_connect_features = speech_all_connect_features[speeches_loss_input & speech_masks]
-                    # Forward-time consistency check: selected latent count should match number of acoustic placeholders
-                    try:
-                        if acoustic_input_mask is not None:
-                            assert speech_connect_features.shape[0] == int(acoustic_input_mask.sum().item()), (
-                                f"Mismatch between selected speech connectors ({speech_connect_features.shape[0]}) and acoustic_input_mask sum ({int(acoustic_input_mask.sum().item())})"
-                            )
-                    except Exception:
-                        pass
-            else:
-                speech_features, speech_connect_features = model.forward_speech_features(
-                        speech_tensors=speech_tensors.type_as(x) if speech_tensors is not None else None,
-                        speech_masks=speech_masks,
-                        speech_type=kwargs.get("speech_type", "audio"),
-                    )
-                if speech_tensors is not None:
-                    x[acoustic_input_mask] = speech_connect_features
 
-            outputs = model.model(
-                input_ids=None,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=x,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=False,
-                return_dict=return_dict,
-                cache_position=cache_position,
+    class _SimpleControl:
+        def __init__(self) -> None:
+            self.should_training_stop: bool = False
+
+
+    def _get_base_model(model: nn.Module) -> VibeVoiceForConditionalGeneration:
+        current = model
+        while hasattr(current, "module"):
+            current = current.module  # type: ignore[assignment]
+        return current  # type: ignore[return-value]
+
+
+    def _ensure_semantic_tensors(model: nn.Module, inputs: Dict[str, Any]) -> None:
+        base_model = _get_base_model(model)
+        sem = inputs.get("speech_semantic_tensors", None)
+        try:
+            target_dtype = next(base_model.model.semantic_connector.parameters()).dtype
+        except Exception:
+            target_dtype = base_model.get_input_embeddings().weight.dtype
+
+        if sem is None:
+            sm = inputs.get("speech_masks")
+            if sm is not None:
+                zeros = torch.zeros(
+                    sm.size(0),
+                    sm.size(1),
+                    getattr(base_model.config, "semantic_vae_dim", 128),
+                    dtype=target_dtype,
+                    device=sm.device,
+                )
+                inputs["speech_semantic_tensors"] = zeros
+        else:
+            if isinstance(sem, torch.Tensor):
+                inputs["speech_semantic_tensors"] = sem.to(dtype=target_dtype)
+
+
+    def training_forward(
+        model: nn.Module,
+        inputs: Dict[str, Any],
+        training_args: CustomTrainingArguments,
+    ) -> VibeVoiceCausalLMOutputWithPast:
+        base_model = _get_base_model(model)
+
+        input_ids = inputs.get("input_ids")
+        attention_mask = inputs.get("attention_mask")
+        position_ids = inputs.get("position_ids")
+        past_key_values = inputs.get("past_key_values")
+        use_cache = inputs.get("use_cache", False)
+        output_attentions = inputs.get("output_attentions")
+        return_dict = inputs.get("return_dict", True)
+        cache_position = inputs.get("cache_position")
+
+        speech_tensors = inputs.get("speech_tensors")
+        speech_masks = inputs.get("speech_masks")
+        speeches_loss_input = inputs.get("speeches_loss_input")
+        speech_semantic_tensors = inputs.get("speech_semantic_tensors")
+        acoustic_input_mask = inputs.get("acoustic_input_mask")
+        acoustic_loss_mask = inputs.get("acoustic_loss_mask")
+        ddpm_batch_mul = training_args.ddpm_batch_mul
+
+        kwargs: Dict[str, Any] = {}
+
+        x = base_model.get_input_embeddings()(input_ids)
+
+        semantic_speech_all_connect_features = base_model.model.semantic_connector(speech_semantic_tensors)
+        speech_features = None
+        speech_connect_features = None
+        speech_len = 0
+
+        if speeches_loss_input is not None:
+            speech_all_features, speech_all_connect_features = base_model.forward_speech_features(
+                speech_tensors=speech_tensors.type_as(x) if speech_tensors is not None else None,
+                speech_masks=speech_masks,
+                speech_type=kwargs.get("speech_type", "audio"),
+                return_unmask=True,
             )
-
-            hidden_states = outputs.last_hidden_state
-            logits = model.lm_head(hidden_states)
-
-            loss = None
-
-            # --- NEW Diffusion Loss Calculation ---
-            diffusion_loss = None
-            # This block is executed only if we are in a context that involves speech.
-            if speech_tensors is not None and acoustic_loss_mask.sum().item() > 0:
-                # Build conditioning mask from positions whose NEXT token is a speech latent (shift left by 1)
-                cond_mask = torch.zeros_like(acoustic_loss_mask, dtype=torch.bool)
-                cond_mask[:, :-1] = acoustic_loss_mask[:, 1:]
-                cond_mask[:, 0] = False
-                condition_features = hidden_states[cond_mask]
-                
-                speech_len, latent_size = speech_features.shape
-                # Sanity check: ensure 1:1 alignment between selected conditions and latents
-                try:
-                    assert condition_features.shape[0] == speech_len, (
-                        f"Mismatch: condition_features={condition_features.shape[0]} vs speech_features={speech_len}"
+            if speech_tensors is not None:
+                if semantic_speech_all_connect_features is not None:
+                    x[acoustic_input_mask] = (
+                        speech_all_connect_features[speech_masks]
+                        + semantic_speech_all_connect_features[speech_masks]
                     )
+                else:
+                    x[acoustic_input_mask] = speech_all_connect_features[speech_masks]
+                selection = speeches_loss_input & speech_masks
+                speech_features = speech_all_features[selection]
+                speech_connect_features = speech_all_connect_features[selection]
+                speech_len = speech_features.shape[0]
+                try:
+                    if acoustic_input_mask is not None:
+                        assert (
+                            speech_connect_features.shape[0]
+                            == int(acoustic_input_mask.sum().item())
+                        ), (
+                            "Mismatch between selected speech connectors "
+                            f"({speech_connect_features.shape[0]}) and acoustic_input_mask sum {int(acoustic_input_mask.sum().item())}"
+                        )
                 except Exception:
                     pass
-                
+        else:
+            speech_features, speech_connect_features = base_model.forward_speech_features(
+                speech_tensors=speech_tensors.type_as(x) if speech_tensors is not None else None,
+                speech_masks=speech_masks,
+                speech_type=kwargs.get("speech_type", "audio"),
+            )
+            if speech_tensors is not None and speech_connect_features is not None:
+                x[acoustic_input_mask] = speech_connect_features
+            if speech_features is not None:
+                speech_len = speech_features.shape[0]
+
+        outputs = base_model.model(
+            input_ids=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=x,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=False,
+            return_dict=return_dict,
+            cache_position=cache_position,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        logits = base_model.lm_head(hidden_states)
+
+        diffusion_loss: Optional[torch.Tensor]
+        if speech_tensors is not None and acoustic_loss_mask is not None and acoustic_loss_mask.sum().item() > 0:
+            cond_mask = torch.zeros_like(acoustic_loss_mask, dtype=torch.bool)
+            cond_mask[:, :-1] = acoustic_loss_mask[:, 1:]
+            cond_mask[:, 0] = False
+            condition_features = hidden_states[cond_mask]
+
+            if speech_features is None:
+                speech_features = torch.zeros(0, hidden_states.size(-1), device=hidden_states.device, dtype=hidden_states.dtype)
+
+            speech_len = speech_features.shape[0]
+            latent_size = speech_features.shape[1] if speech_len > 0 else 0
+
+            try:
+                assert condition_features.shape[0] == speech_len, (
+                    f"Mismatch: condition_features={condition_features.shape[0]} vs speech_features={speech_len}"
+                )
+            except Exception:
+                pass
+
+            if latent_size > 0 and speech_len > 0:
                 noise = torch.randn(
-                    (speech_len * ddmp_batch_mul, latent_size),
+                    (speech_len * ddpm_batch_mul, latent_size),
                     device=hidden_states.device,
-                    dtype=hidden_states.dtype
+                    dtype=hidden_states.dtype,
                 )
-                
+
                 timesteps = torch.multinomial(
-                    torch.ones(model.config.diffusion_head_config.ddpm_num_steps),
-                    speech_len * ddmp_batch_mul,
+                    torch.ones(base_model.config.diffusion_head_config.ddpm_num_steps, device=hidden_states.device),
+                    speech_len * ddpm_batch_mul,
                     replacement=True,
-                ).to(hidden_states.device)
-
-                speech_features_repeated = speech_features.repeat_interleave(ddmp_batch_mul, dim=0)
-                condition_features_repeated = condition_features.repeat_interleave(ddmp_batch_mul, dim=0)
-
-                noisy_speech_features = model.model.noise_scheduler.add_noise(
-                    speech_features_repeated, noise, timesteps
-                )
-                
-                model_output = model.model.prediction_head(
-                    noisy_speech_features, 
-                    timesteps.type_as(x), 
-                    condition_features_repeated
                 )
 
-                prediction_type = model.config.diffusion_head_config.prediction_type
+                speech_features_repeated = speech_features.repeat_interleave(ddpm_batch_mul, dim=0)
+                condition_features_repeated = condition_features.repeat_interleave(ddpm_batch_mul, dim=0)
+
+                noisy_speech_features = base_model.model.noise_scheduler.add_noise(
+                    speech_features_repeated,
+                    noise,
+                    timesteps,
+                )
+
+                model_output = base_model.model.prediction_head(
+                    noisy_speech_features,
+                    timesteps.type_as(hidden_states),
+                    condition_features_repeated,
+                )
+
+                prediction_type = base_model.config.diffusion_head_config.prediction_type
                 if prediction_type == "epsilon":
                     target_for_loss = noise
                 elif prediction_type == "v_prediction":
-                    target_for_loss = model.model.noise_scheduler.get_velocity(
-                        speech_features_repeated, noise, timesteps
+                    target_for_loss = base_model.model.noise_scheduler.get_velocity(
+                        speech_features_repeated,
+                        noise,
+                        timesteps,
                     )
                 else:
                     raise NotImplementedError(f"Prediction type {prediction_type} not implemented")
 
-                diffusion_loss = F.mse_loss(model_output.float(), target_for_loss.float(), reduction='sum')
-                if latent_size > 0 and ddmp_batch_mul > 0:
-                    # Normalize by latent dim, number of sampled diffusion steps per latent, and number of speech tokens
-                    diffusion_loss = diffusion_loss / latent_size / ddmp_batch_mul / max(speech_len, 1)
-                else:
-                    diffusion_loss = torch.tensor(0.0, device=diffusion_loss.device)
-            
+                diffusion_loss = F.mse_loss(
+                    model_output.float(),
+                    target_for_loss.float(),
+                    reduction="sum",
+                )
+                diffusion_loss = diffusion_loss / latent_size / ddpm_batch_mul / max(speech_len, 1)
             else:
-                # Dummy loss for DDP to work when there are no speech samples in a batch,
-                # but we are in a speech context.
-                diffusion_loss = sum(p.sum() for p in model.model.prediction_head.parameters()) * 0.0
-                diffusion_loss += sum(p.sum() for p in model.model.acoustic_connector.parameters()) * 0.0
-                diffusion_loss += sum(p.sum() for p in model.model.semantic_connector.parameters()) * 0.0
-            # --- End NEW Diffusion Loss Calculation ---
+                diffusion_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+        else:
+            diffusion_loss = sum(p.sum() for p in base_model.model.prediction_head.parameters()) * 0.0
+            diffusion_loss += sum(p.sum() for p in base_model.model.acoustic_connector.parameters()) * 0.0
+            diffusion_loss += sum(p.sum() for p in base_model.model.semantic_connector.parameters()) * 0.0
 
-            from vibevoice.modular.modeling_vibevoice import VibeVoiceCausalLMOutputWithPast
-            return VibeVoiceCausalLMOutputWithPast(
-                loss=loss,
-                diffusion_loss=diffusion_loss,
-                speech_token_num=speech_len if speech_tensors is not None else 0,
-                logits=logits,
-                past_key_values=outputs.past_key_values,
-                hidden_states=outputs.hidden_states,
-                attentions=outputs.attentions,
-            )
+        return VibeVoiceCausalLMOutputWithPast(
+            loss=None,
+            diffusion_loss=diffusion_loss,
+            speech_token_num=speech_len if speech_tensors is not None else 0,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
-        def compute_loss(self, model: VibeVoiceForConditionalGeneration, inputs: Dict[str, Any], return_outputs=False, num_items_in_batch: Optional[int] = None):
-            labels = inputs.get("input_ids")
-            attention_mask = inputs.get("attention_mask")
-            acoustic_input_mask = inputs.get("acoustic_input_mask")
 
-            # Ensure semantic tensors exist and have correct dtype/device
-            sem = inputs.get("speech_semantic_tensors", None)
-            try:
-                target_dtype = next(model.model.semantic_connector.parameters()).dtype
-            except Exception:
-                target_dtype = model.get_input_embeddings().weight.dtype
+    def _compute_total_loss(
+        model: nn.Module,
+        inputs: Dict[str, Any],
+        training_args: CustomTrainingArguments,
+        global_step: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]:
+        labels = inputs.get("input_ids")
+        attention_mask = inputs.get("attention_mask")
+        acoustic_input_mask = inputs.get("acoustic_input_mask")
 
-            if sem is None:
-                sm = inputs.get("speech_masks")
-                if sm is not None:
-                    zeros = torch.zeros(
-                        sm.size(0), sm.size(1),
-                        getattr(model.config, "semantic_vae_dim", 128),
-                        dtype=target_dtype,
-                        device=sm.device,
+        _ensure_semantic_tensors(model, inputs)
+
+        outputs = training_forward(model, inputs, training_args)
+
+        try:
+            al_mask = inputs.get("acoustic_loss_mask")
+            sp_masks = inputs.get("speech_masks")
+            sp_loss_sel = inputs.get("speeches_loss_input")
+            num_tok_total = int(acoustic_input_mask.sum().item()) if acoustic_input_mask is not None else 0
+            num_tok_loss = int(al_mask.sum().item()) if al_mask is not None else 0
+            num_lat_total = int(sp_masks.sum().item()) if sp_masks is not None else 0
+            num_lat_loss = int(((sp_loss_sel & sp_masks).sum().item())) if (sp_loss_sel is not None and sp_masks is not None) else 0
+            if global_step <= 1 or (
+                hasattr(training_args, "logging_steps")
+                and training_args.logging_steps
+                and global_step % max(1, int(training_args.logging_steps)) == 0
+            ):
+                logger.debug(
+                    "Selection summary step %s | tok_total=%s tok_loss=%s lat_total=%s lat_loss=%s",
+                    global_step,
+                    num_tok_total,
+                    num_tok_loss,
+                    num_lat_total,
+                    num_lat_loss,
+                )
+            if sp_loss_sel is not None and sp_masks is not None and al_mask is not None:
+                if num_tok_loss != num_lat_loss:
+                    logger.warning(
+                        f"Loss selection mismatch: acoustic_loss_mask={num_tok_loss} vs speeches_loss_input={num_lat_loss}"
                     )
-                    inputs["speech_semantic_tensors"] = zeros
-            else:
-                if isinstance(sem, torch.Tensor):
-                    inputs["speech_semantic_tensors"] = sem.to(dtype=target_dtype)
+        except Exception:
+            pass
 
-            # Use custom training forward pass with new diffusion loss
-            outputs = self.training_forward(model, inputs)
+        logits = outputs.logits
+        ce_labels = mask_for_ce(labels, attention_mask, acoustic_input_mask, pad_id=-100)
+        shift_logits = logits[:, :-1, :].contiguous()
+        loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+        ce_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), ce_labels.view(-1))
 
-            # Invariants: token/latent selection equality across views (warn, don't assert)
-            try:
-                al_mask = inputs.get("acoustic_loss_mask")
-                sp_masks = inputs.get("speech_masks")
-                sp_loss_sel = inputs.get("speeches_loss_input")
-                num_tok_total = int(acoustic_input_mask.sum().item()) if acoustic_input_mask is not None else 0
-                num_tok_loss = int(al_mask.sum().item()) if al_mask is not None else 0
-                num_lat_total = int(sp_masks.sum().item()) if sp_masks is not None else 0
-                num_lat_loss = int(((sp_loss_sel & sp_masks).sum().item())) if (sp_loss_sel is not None and sp_masks is not None) else 0
-                self.log({
-                    "debug/num_tok_total": float(num_tok_total),
-                    "debug/num_tok_loss": float(num_tok_loss),
-                    "debug/num_lat_total": float(num_lat_total),
-                    "debug/num_lat_loss": float(num_lat_loss),
-                })
-                if sp_loss_sel is not None and sp_masks is not None and al_mask is not None:
-                    if num_tok_loss != num_lat_loss:
-                        logger.warning(f"Loss selection mismatch: acoustic_loss_mask={num_tok_loss} vs speeches_loss_input={num_lat_loss}")
-            except Exception:
-                pass
+        _maybe_debug_ce(
+            shift_logits,
+            ce_labels,
+            attention_mask,
+            acoustic_input_mask,
+            training_args,
+            global_step,
+        )
 
-            # CE Loss
-            logits = outputs.logits
-            ce_labels = mask_for_ce(labels, attention_mask, acoustic_input_mask, pad_id=-100)
-            shift_logits = logits[:, :-1, :].contiguous()
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            ce_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), ce_labels.view(-1))
+        diffusion_loss = (
+            outputs.diffusion_loss
+            if outputs.diffusion_loss is not None
+            else torch.tensor(0.0, device=ce_loss.device)
+        )
+        total = (
+            training_args.ce_loss_weight * ce_loss
+            + training_args.diffusion_loss_weight * diffusion_loss
+        )
 
-            # Optional CE diagnostics
-            try:
-                self._debug_ce(shift_logits, ce_labels, attention_mask, acoustic_input_mask)
-            except Exception as e:
-                logger.warning(f"Failed invoking CE debug: {e}")
-
-            # Diffusion loss
-            diffusion_loss = outputs.diffusion_loss if outputs.diffusion_loss is not None else torch.tensor(0.0, device=ce_loss.device)
-            total = training_args.ce_loss_weight * ce_loss + training_args.diffusion_loss_weight * diffusion_loss
-
-            # Logs
-            try:
-                prefix = "train" if model.training else "eval"
-                self.log({
-                    f"{prefix}/ce_loss": ce_loss.detach().item(),
-                    f"{prefix}/diffusion_loss": diffusion_loss.detach().item() if isinstance(diffusion_loss, torch.Tensor) else float(diffusion_loss),
-                })
-                if hasattr(self, "optimizer") and self.optimizer is not None and len(self.optimizer.param_groups) > 0:
-                    lr_val = self.optimizer.param_groups[0].get("lr", None)
-                    if lr_val is not None:
-                        self.log({"train/learning_rate_real": float(lr_val)})
-            except Exception:
-                pass
-
-            return (total, outputs) if return_outputs else total
-
-        def _debug_ce(self, shift_logits: torch.Tensor, ce_labels: torch.Tensor, attention_mask: Optional[torch.Tensor], acoustic_input_mask: Optional[torch.Tensor]):
-            try:
-                if not getattr(training_args, "debug_ce_details", False):
-                    return
-                step = int(getattr(self.state, "global_step", 0) or 0)
-                every_n = max(1, int(getattr(training_args, "debug_ce_every_n_steps", 200) or 200))
-                if not (step <= 1 or (step % every_n == 0)):
-                    return
-
-                with torch.no_grad():
-                    vocab = shift_logits.size(-1)
-                    per_token_loss = F.cross_entropy(
-                        shift_logits.view(-1, vocab),
-                        ce_labels.view(-1),
-                        reduction="none",
-                        ignore_index=-100,
-                    ).view_as(ce_labels)
-
-                    valid_mask = ce_labels.ne(-100)
-                    num_valid = int(valid_mask.sum().item())
-                    avg_loss = float((per_token_loss[valid_mask].mean().item())) if num_valid > 0 else float("nan")
-
-                    per_ex_avgs = []
-                    max_examples = max(1, int(getattr(training_args, "debug_ce_max_examples", 1) or 1))
-                    B = ce_labels.size(0)
-                    for b in range(min(B, max_examples)):
-                        vb = valid_mask[b]
-                        if int(vb.sum().item()) > 0:
-                            per_ex_avgs.append(float(per_token_loss[b][vb].mean().item()))
-                        else:
-                            per_ex_avgs.append(float("nan"))
-                    logger.info(f"CE debug: tokens_in_loss={num_valid}, avg_loss={avg_loss:.4f}, per_example_avgs={[round(x,4) if x==x else None for x in per_ex_avgs]}")
-            except Exception as e:
-                logger.warning(f"CE detailed debug failed: {e}")
-
-        # --------- CRITICAL SAVE OVERRIDES: also dump FULL head/connectors for inference ---------
-  
-
-        def _save(self, output_dir: Optional[str] = None, state_dict=None) -> None:
-            try:
-                target_dir = output_dir or self.args.output_dir
-                lora_out = os.path.join(target_dir, "lora")
-                os.makedirs(lora_out, exist_ok=True)
-    
-                # --- LLM PEFT adapters (if LoRA-wrapped) ---
-                language_model = getattr(self.model.model, "language_model", None)
-                if hasattr(language_model, "save_pretrained"):
-                    language_model.save_pretrained(lora_out)
-    
-                # --- Diffusion head PEFT adapters (if LoRA-wrapped) ---
-                pred_head = getattr(self.model.model, "prediction_head", None)
-                if hasattr(pred_head, "save_pretrained"):
-                    ph_dir = os.path.join(lora_out, "diffusion_head")
-                    os.makedirs(ph_dir, exist_ok=True)
-                    pred_head.save_pretrained(ph_dir)
-    
-                # --- ALWAYS save FULL diffusion head state_dict for fallback ---
-                if pred_head is not None and hasattr(pred_head, "state_dict"):
-                    sd = pred_head.state_dict()
-                    torch.save(sd, os.path.join(lora_out, "diffusion_head_full.bin"))
-                    ph_dir = os.path.join(lora_out, "diffusion_head")
-                    os.makedirs(ph_dir, exist_ok=True)
-                    torch.save(sd, os.path.join(ph_dir, "diffusion_head_full.bin"))
-    
-                # --- Connectors (plain state_dicts) ---
-                ac = getattr(self.model.model, "acoustic_connector", None)
-                if ac is not None:
-                    ac_dir = os.path.join(lora_out, "acoustic_connector")
-                    os.makedirs(ac_dir, exist_ok=True)
-                    torch.save(ac.state_dict(), os.path.join(ac_dir, "pytorch_model.bin"))
-    
-                se = getattr(self.model.model, "semantic_connector", None)
-                if se is not None:
-                    se_dir = os.path.join(lora_out, "semantic_connector")
-                    os.makedirs(se_dir, exist_ok=True)
-                    torch.save(se.state_dict(), os.path.join(se_dir, "pytorch_model.bin"))
-    
-            except Exception as e:
-                logger.warning(f"Failed to save LoRA assets: {e}")
+        return total, ce_loss.detach(), diffusion_loss.detach(), outputs
 
 
-    # ------------- Build the Trainer -------------
+    def _maybe_debug_ce(
+        shift_logits: torch.Tensor,
+        ce_labels: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        acoustic_input_mask: Optional[torch.Tensor],
+        training_args: CustomTrainingArguments,
+        global_step: int,
+    ) -> None:
+        try:
+            if not getattr(training_args, "debug_ce_details", False):
+                return
+            every_n = max(1, int(getattr(training_args, "debug_ce_every_n_steps", 200) or 200))
+            if not (global_step <= 1 or (global_step % every_n == 0)):
+                return
 
-    # Resolve which adapters to apply in samples
+            with torch.no_grad():
+                vocab = shift_logits.size(-1)
+                per_token_loss = F.cross_entropy(
+                    shift_logits.view(-1, vocab),
+                    ce_labels.view(-1),
+                    reduction="none",
+                    ignore_index=-100,
+                ).view_as(ce_labels)
+
+                valid_mask = ce_labels.ne(-100)
+                num_valid = int(valid_mask.sum().item())
+                avg_loss = (
+                    float(per_token_loss[valid_mask].mean().item())
+                    if num_valid > 0
+                    else float("nan")
+                )
+
+                per_ex_avgs: List[Optional[float]] = []
+                max_examples = max(1, int(getattr(training_args, "debug_ce_max_examples", 1) or 1))
+                B = ce_labels.size(0)
+                for b in range(min(B, max_examples)):
+                    vb = valid_mask[b]
+                    if int(vb.sum().item()) > 0:
+                        per_ex_avgs.append(float(per_token_loss[b][vb].mean().item()))
+                    else:
+                        per_ex_avgs.append(None)
+                logger.info(
+                    "CE debug: tokens_in_loss=%s, avg_loss=%.4f, per_example_avgs=%s",
+                    num_valid,
+                    avg_loss,
+                    per_ex_avgs,
+                )
+        except Exception as e:
+            logger.warning(f"CE detailed debug failed: {e}")
+
+
+    def _save_lora_assets(model: VibeVoiceForConditionalGeneration, output_dir: str) -> None:
+        try:
+            lora_out = os.path.join(output_dir, "lora")
+            os.makedirs(lora_out, exist_ok=True)
+
+            language_model = getattr(model.model, "language_model", None)
+            if hasattr(language_model, "save_pretrained"):
+                language_model.save_pretrained(lora_out)
+
+            pred_head = getattr(model.model, "prediction_head", None)
+            if hasattr(pred_head, "save_pretrained"):
+                ph_dir = os.path.join(lora_out, "diffusion_head")
+                os.makedirs(ph_dir, exist_ok=True)
+                pred_head.save_pretrained(ph_dir)
+
+            if pred_head is not None and hasattr(pred_head, "state_dict"):
+                sd = pred_head.state_dict()
+                torch.save(sd, os.path.join(lora_out, "diffusion_head_full.bin"))
+                ph_dir = os.path.join(lora_out, "diffusion_head")
+                os.makedirs(ph_dir, exist_ok=True)
+                torch.save(sd, os.path.join(ph_dir, "diffusion_head_full.bin"))
+
+            ac = getattr(model.model, "acoustic_connector", None)
+            if ac is not None:
+                ac_dir = os.path.join(lora_out, "acoustic_connector")
+                os.makedirs(ac_dir, exist_ok=True)
+                torch.save(ac.state_dict(), os.path.join(ac_dir, "pytorch_model.bin"))
+
+            se = getattr(model.model, "semantic_connector", None)
+            if se is not None:
+                se_dir = os.path.join(lora_out, "semantic_connector")
+                os.makedirs(se_dir, exist_ok=True)
+                torch.save(se.state_dict(), os.path.join(se_dir, "pytorch_model.bin"))
+
+        except Exception as e:
+            logger.warning(f"Failed to save LoRA assets: {e}")
+
+
+    def _evaluate(
+        model: VibeVoiceForConditionalGeneration,
+        eval_dataloader: DataLoader,
+        accelerator: Accelerator,
+        training_args: CustomTrainingArguments,
+        ema_cb: EmaCallback,
+        state: _SimpleState,
+        control: _SimpleControl,
+    ) -> Dict[str, float]:
+        if eval_dataloader is None:
+            return {}
+
+        ema_cb.on_evaluate(training_args, state, control, model=accelerator.unwrap_model(model))
+
+        model.eval()
+        losses = []
+        ce_losses = []
+        diffusion_losses = []
+        speech_counts = []
+
+        with torch.no_grad():
+            for batch in eval_dataloader:
+                total_loss, ce_loss, diffusion_loss, outputs = _compute_total_loss(
+                    model,
+                    batch,
+                    training_args,
+                    state.global_step,
+                )
+                losses.append(accelerator.gather(total_loss.detach().clone()))
+                ce_losses.append(accelerator.gather(ce_loss.detach().clone()))
+                diffusion_losses.append(accelerator.gather(diffusion_loss.detach().clone()))
+                speech_counts.append(
+                    accelerator.gather(
+                        torch.tensor(
+                            [int(outputs.speech_token_num)],
+                            device=total_loss.device,
+                        )
+                    )
+                )
+
+        ema_cb.on_evaluate_end(training_args, state, control, model=accelerator.unwrap_model(model))
+        model.train()
+
+        def _stack_and_mean(tensors: List[torch.Tensor]) -> float:
+            if len(tensors) == 0:
+                return 0.0
+            cat = torch.cat(tensors)
+            if cat.numel() == 0:
+                return 0.0
+            return cat.float().mean().item()
+
+        result = {
+            "eval/loss": _stack_and_mean(losses),
+            "eval/ce_loss": _stack_and_mean(ce_losses),
+            "eval/diffusion_loss": _stack_and_mean(diffusion_losses),
+            "eval/speech_tokens": float(torch.cat(speech_counts).sum().item()) if len(speech_counts) > 0 else 0.0,
+        }
+        return result
+
+
+    def _save_checkpoint(
+        accelerator: Accelerator,
+        model: VibeVoiceForConditionalGeneration,
+        training_args: CustomTrainingArguments,
+        ema_cb: EmaCallback,
+        state: _SimpleState,
+        control: _SimpleControl,
+        output_dir: str,
+    ) -> None:
+        accelerator.wait_for_everyone()
+        unwrapped = accelerator.unwrap_model(model)
+        ema_cb.on_save(training_args, state, control, model=unwrapped)
+        try:
+            if accelerator.is_main_process:
+                os.makedirs(output_dir, exist_ok=True)
+                _save_lora_assets(unwrapped, output_dir)
+        finally:
+            ema_cb.on_save_end(training_args, state, control, model=unwrapped)
+
+        accelerator.save_state(output_dir)
+
+    # ================= ACCELERATE TRAINING LOOP =================
 
     ema_cb = EmaCallback(attr_path="model.prediction_head", decay=0.999, device="cpu")
+    lora_debug_cb = LoRADebugCallback(log_every_n_steps=int(getattr(training_args, "logging_steps", 50) or 50))
+    callbacks: List[TrainerCallback] = [ema_cb, lora_debug_cb]
 
-    trainer = VibeVoiceTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=data_collator,
-        callbacks=[ema_cb, LoRADebugCallback(log_every_n_steps=(int(getattr(training_args, "logging_steps", 50) or 50)))],
-    )
-
-    # Optional debug pre-training save
-    if getattr(training_args, "debug_save", False):
-        try:
-            debug_dir = os.path.join(training_args.output_dir, "debug_initial")
-            lora_out = os.path.join(debug_dir, "lora")
-            os.makedirs(lora_out, exist_ok=True)
-            logger.info(f"[debug_save] Saving initial (pre-training) model components to: {debug_dir}")
-            # language model adapters / base
-            try:
-                if hasattr(model.model.language_model, "save_pretrained"):
-                    model.model.language_model.save_pretrained(lora_out)
-            except Exception as e_lm:
-                logger.warning(f"[debug_save] Failed to save language_model: {e_lm}")
-            # diffusion head
-            try:
-                if hasattr(model.model, "prediction_head") and hasattr(model.model.prediction_head, "save_pretrained"):
-                    model.model.prediction_head.save_pretrained(os.path.join(lora_out, "diffusion_head"))
-            except Exception as e_head:
-                logger.warning(f"[debug_save] Failed to save prediction_head: {e_head}")
-            # NEW: full diffusion head state_dict as fallback
-            try:
-                ph = getattr(model.model, "prediction_head", None)
-                if ph is not None and hasattr(ph, "state_dict"):
-                    sd = ph.state_dict()
-                    torch.save(sd, os.path.join(lora_out, "diffusion_head_full.bin"))
-                    os.makedirs(os.path.join(lora_out, "diffusion_head"), exist_ok=True)
-                    torch.save(sd, os.path.join(lora_out, "diffusion_head", "diffusion_head_full.bin"))
-            except Exception as e:
-                logger.warning(f"[debug_save] Failed to save FULL diffusion head: {e}")
-            # connectors
-            try:
-                ac_conn = getattr(model.model, "acoustic_connector", None)
-                if ac_conn is not None:
-                    ac_dir = os.path.join(lora_out, "acoustic_connector")
-                    os.makedirs(ac_dir, exist_ok=True)
-                    torch.save(ac_conn.state_dict(), os.path.join(ac_dir, "pytorch_model.bin"))
-            except Exception as e_ac:
-                logger.warning(f"[debug_save] Failed to save acoustic_connector: {e_ac}")
-            try:
-                se_conn = getattr(model.model, "semantic_connector", None)
-                if se_conn is not None:
-                    se_dir = os.path.join(lora_out, "semantic_connector")
-                    os.makedirs(se_dir, exist_ok=True)
-                    torch.save(se_conn.state_dict(), os.path.join(se_dir, "pytorch_model.bin"))
-            except Exception as e_se:
-                logger.warning(f"[debug_save] Failed to save semantic_connector: {e_se}")
-        except Exception as e:
-            logger.warning(f"[debug_save] Unexpected failure saving initial components: {e}")
+    eval_strategy = getattr(training_args, "evaluation_strategy", IntervalStrategy.NO)
+    if isinstance(eval_strategy, str):
+        eval_strategy = IntervalStrategy(eval_strategy)
+    save_strategy = getattr(training_args, "save_strategy", IntervalStrategy.STEPS)
+    if isinstance(save_strategy, str):
+        save_strategy = IntervalStrategy(save_strategy)
 
     if getattr(training_args, "gradient_checkpointing", False):
         try:
@@ -995,56 +1086,336 @@ def main() -> None:
         except Exception:
             logger.warning("Failed to enable gradient checkpointing on the model.")
 
-    if training_args.do_train:
-        trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
-    
-        lora_out = os.path.join(training_args.output_dir, "lora")
-        os.makedirs(lora_out, exist_ok=True)
-    
-        # LLM PEFT (if any)
-        lm = getattr(model.model, "language_model", None)
-        if hasattr(lm, "save_pretrained"):
-            lm.save_pretrained(lora_out)
-    
-        # Diffusion head PEFT (if any)
-        ph = getattr(model.model, "prediction_head", None)
-        if hasattr(ph, "save_pretrained"):
-            ph_dir = os.path.join(lora_out, "diffusion_head")
-            os.makedirs(ph_dir, exist_ok=True)
-            ph.save_pretrained(ph_dir)
-    
-        # ALWAYS: full diffusion head state_dict fallback
-        try:
-            if ph is not None and hasattr(ph, "state_dict"):
-                sd = ph.state_dict()
-                torch.save(sd, os.path.join(lora_out, "diffusion_head_full.bin"))
-                ph_dir = os.path.join(lora_out, "diffusion_head")
-                os.makedirs(ph_dir, exist_ok=True)
-                torch.save(sd, os.path.join(ph_dir, "diffusion_head_full.bin"))
-        except Exception as e:
-            logger.warning(f"Failed to save FULL diffusion head at end: {e}")
-    
-        # Connectors (if trained)
-        try:
-            ac = getattr(model.model, "acoustic_connector", None)
-            if ac is not None:
-                ac_dir = os.path.join(lora_out, "acoustic_connector")
-                os.makedirs(ac_dir, exist_ok=True)
-                torch.save(ac.state_dict(), os.path.join(ac_dir, "pytorch_model.bin"))
-        except Exception as e:
-            logger.warning(f"Failed to save acoustic_connector: {e}")
-    
-        try:
-            se = getattr(model.model, "semantic_connector", None)
-            if se is not None:
-                se_dir = os.path.join(lora_out, "semantic_connector")
-                os.makedirs(se_dir, exist_ok=True)
-                torch.save(se.state_dict(), os.path.join(se_dir, "pytorch_model.bin"))
-        except Exception as e:
-            logger.warning(f"Failed to save semantic_connector: {e}")
+    log_with = training_args.report_to
+    if log_with is None:
+        log_with_list: List[str] = []
+    elif isinstance(log_with, str):
+        log_with_list = [log_with]
+    else:
+        log_with_list = list(log_with)
 
-    if training_args.do_eval and eval_dataset is not None:
-        trainer.evaluate()
+    mixed_precision = "bf16" if training_args.bf16 else ("fp16" if getattr(training_args, "fp16", False) else "no")
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=training_args.gradient_accumulation_steps,
+        log_with=log_with_list if len(log_with_list) > 0 else None,
+        project_dir=training_args.logging_dir if len(log_with_list) > 0 else None,
+        mixed_precision=mixed_precision,
+        step_scheduler_with_optimizer=False,
+    )
+
+    if accelerator.is_main_process:
+        os.makedirs(training_args.output_dir, exist_ok=True)
+    accelerator.wait_for_everyone()
+
+    if len(log_with_list) > 0:
+        try:
+            tracker_config = training_args.to_sanitized_dict()
+        except Exception:
+            tracker_config = {}
+        accelerator.init_trackers("vibevoice_finetune", config=tracker_config)
+
+    train_dataloader = DataLoader(
+        train_dataset,
+        shuffle=True,
+        batch_size=training_args.per_device_train_batch_size,
+        collate_fn=data_collator,
+        num_workers=training_args.dataloader_num_workers,
+        pin_memory=training_args.dataloader_pin_memory,
+        drop_last=training_args.dataloader_drop_last,
+        persistent_workers=training_args.dataloader_num_workers > 0,
+    )
+
+    eval_dataloader: Optional[DataLoader] = None
+    if eval_dataset is not None:
+        eval_dataloader = DataLoader(
+            eval_dataset,
+            shuffle=False,
+            batch_size=training_args.per_device_eval_batch_size,
+            collate_fn=data_collator,
+            num_workers=training_args.dataloader_num_workers,
+            pin_memory=training_args.dataloader_pin_memory,
+            drop_last=False,
+            persistent_workers=training_args.dataloader_num_workers > 0,
+        )
+
+    no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight", "layernorm.weight", "layernorm.bias"]
+    decay_params = []
+    nodecay_params = []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if any(nd in n for nd in no_decay):
+            nodecay_params.append(p)
+        else:
+            decay_params.append(p)
+    optimizer_grouped_parameters = []
+    if decay_params:
+        optimizer_grouped_parameters.append({"params": decay_params, "weight_decay": training_args.weight_decay})
+    if nodecay_params:
+        optimizer_grouped_parameters.append({"params": nodecay_params, "weight_decay": 0.0})
+    optimizer = AdamW(
+        optimizer_grouped_parameters,
+        lr=training_args.learning_rate,
+        betas=(training_args.adam_beta1, training_args.adam_beta2),
+        eps=training_args.adam_epsilon,
+    )
+
+    # Calculate steps per epoch accounting for multi-GPU training
+    # Each GPU processes per_device_batch_size samples, so effective batch size is multiplied by num_processes
+    num_processes = max(1, accelerator.num_processes)
+    num_update_steps_per_epoch = max(
+        1, 
+        math.ceil(len(train_dataloader) / (training_args.gradient_accumulation_steps * num_processes))
+    )
+    
+    if training_args.max_steps and training_args.max_steps > 0:
+        max_train_steps = training_args.max_steps
+        num_train_epochs = max(1, math.ceil(training_args.max_steps / num_update_steps_per_epoch))
+    else:
+        num_train_epochs = max(1, math.ceil(training_args.num_train_epochs))
+        max_train_steps = num_train_epochs * num_update_steps_per_epoch
+
+    # Calculate warmup steps: prioritize warmup_steps, otherwise use warmup_ratio
+    if training_args.warmup_ratio and training_args.warmup_ratio > 0.0:
+        warmup_steps = int(max_train_steps * training_args.warmup_ratio)
+    elif training_args.warmup_steps and training_args.warmup_steps > 0:
+        warmup_steps = training_args.warmup_steps
+    else:
+        warmup_steps = 0
+    
+    # Log warmup configuration
+    if accelerator.is_main_process:
+        logger.info(f"Warmup configuration:")
+        logger.info(f"  warmup_steps (arg): {training_args.warmup_steps}")
+        logger.info(f"  warmup_ratio (arg): {training_args.warmup_ratio}")
+        logger.info(f"  max_train_steps: {max_train_steps}")
+        logger.info(f"  calculated warmup_steps: {warmup_steps} ({warmup_steps/max_train_steps*100:.2f}% of training)")
+
+    logger.info(f"Using lr_scheduler: {training_args.lr_scheduler_type}")
+    logger.info(f"Learning rate: {optimizer.defaults['lr']}")
+    logger.info(f"Total optimization steps: {max_train_steps}")
+    logger.info(f"Warmup steps: {warmup_steps}")
+    logger.info(f"Kwargs for scheduler: {training_args.lr_scheduler_kwargs}")
+
+    
+    lr_scheduler = get_scheduler(
+        name=training_args.lr_scheduler_type,
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=max_train_steps,
+        scheduler_specific_kwargs=training_args.lr_scheduler_kwargs
+    )
+
+    logger.info(str(lr_scheduler))
+
+
+    if eval_dataloader is not None:
+        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+            model,
+            optimizer,
+            train_dataloader,
+            eval_dataloader,
+            lr_scheduler,
+        )
+    else:
+        model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            model,
+            optimizer,
+            train_dataloader,
+            lr_scheduler,
+        )
+
+    optimizer.zero_grad(set_to_none=True)
+
+    state = _SimpleState()
+    control = _SimpleControl()
+
+    for cb in callbacks:
+        try:
+            cb.on_train_begin(training_args, state, control, model=accelerator.unwrap_model(model))
+        except Exception as cb_err:
+            logger.warning(f"Callback {cb.__class__.__name__} on_train_begin failed: {cb_err}")
+
+    if getattr(training_args, "debug_save", False):
+        debug_dir = os.path.join(training_args.output_dir, "debug_initial")
+        if accelerator.is_main_process:
+            os.makedirs(debug_dir, exist_ok=True)
+            _save_lora_assets(accelerator.unwrap_model(model), debug_dir)
+        accelerator.wait_for_everyone()
+
+    completed_steps = 0
+    start_epoch = 0
+    if training_args.resume_from_checkpoint:
+        accelerator.load_state(training_args.resume_from_checkpoint)
+        base = os.path.basename(os.path.normpath(training_args.resume_from_checkpoint))
+        try:
+            resumed_step = int(base.split("-")[-1])
+        except ValueError:
+            resumed_step = 0
+        state.global_step = resumed_step
+        completed_steps = resumed_step
+        start_epoch = resumed_step // num_update_steps_per_epoch
+
+    total_batch_size = (
+        training_args.per_device_train_batch_size
+        * max(1, accelerator.num_processes)
+        * training_args.gradient_accumulation_steps
+    )
+
+    if accelerator.is_main_process:
+        logger.info("***** Running training *****")
+        logger.info(f"  Num examples = {len(train_dataset)}")
+        logger.info(f"  Num Epochs = {num_train_epochs}")
+        logger.info(f"  Num processes (GPUs) = {accelerator.num_processes}")
+        logger.info(f"  Instantaneous batch size per device = {training_args.per_device_train_batch_size}")
+        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+        logger.info(f"  Gradient Accumulation steps = {training_args.gradient_accumulation_steps}")
+        logger.info(f"  Total optimization steps = {max_train_steps}")
+        logger.info(f"  Warmup steps = {warmup_steps} ({warmup_steps/max_train_steps*100:.1f}% of training)")
+        if training_args.resume_from_checkpoint:
+            logger.info(f"  Resuming from checkpoint: {training_args.resume_from_checkpoint}")
+
+    progress_bar = tqdm(range(max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar.set_description("Training")
+    if completed_steps > 0:
+        progress_bar.update(completed_steps)
+
+    logging_steps = max(1, int(getattr(training_args, "logging_steps", 100) or 100))
+
+    for epoch in range(start_epoch, num_train_epochs):
+        model.train()
+        if completed_steps >= max_train_steps:
+            break
+
+        for step, batch in enumerate(train_dataloader):
+            if completed_steps >= max_train_steps:
+                break
+
+            with accelerator.accumulate(model):
+                # dummy forward to trigger ddp sync in forward
+                _ = model(None)
+
+                total_loss, ce_loss, diffusion_loss, _ = _compute_total_loss(
+                    model,
+                    batch,
+                    training_args,
+                    state.global_step,
+                )
+
+                accelerator.backward(total_loss)
+
+                grad_norm = None
+                if accelerator.sync_gradients and getattr(training_args, "gradient_clipping", False) and training_args.max_grad_norm and training_args.max_grad_norm > 0:
+                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), training_args.max_grad_norm)
+                
+                if accelerator.sync_gradients:
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+            if not accelerator.sync_gradients:
+                continue
+
+            # # Periodic weight synchronization check (every 500 steps and first 5 steps)
+            # if accelerator.num_processes > 1 and (completed_steps < 5 or (completed_steps + 1) % 500 == 0):
+            #     check_passed = True
+            #     with torch.no_grad():
+            #         for n, p in model.named_parameters():
+            #             if not p.requires_grad:
+            #                 continue
+            #             params_gathered = accelerator.gather(p.detach().unsqueeze(0))
+            #             for _i in range(1, accelerator.num_processes):
+            #                 if not torch.allclose(params_gathered[0], params_gathered[_i], atol=1e-6):
+            #                     logger.error(
+            #                         f"Step {completed_steps + 1}: Parameter {n} NOT synchronized! rank0 != rank{_i}"
+            #                     )
+            #                     check_passed = False
+            #                     break
+            #             if not check_passed:
+            #                 break
+            #     if check_passed and accelerator.is_main_process:
+            #         logger.info(f"Step {completed_steps + 1}: ✓ Weight synchronization check passed.")
+
+            if state.global_step % logging_steps == 0 or state.global_step == 1:
+                gathered_total = accelerator.reduce(total_loss.detach(), reduction="mean").item()
+                gathered_ce = accelerator.reduce(ce_loss.detach(), reduction="mean").item()
+                gathered_diff = accelerator.reduce(diffusion_loss.detach(), reduction="mean").item()
+                log_dict = {
+                    "train/total_loss": gathered_total,
+                    "train/ce_loss": gathered_ce,
+                    "train/diffusion_loss": gathered_diff,
+                }
+
+                if len(optimizer.param_groups) > 0:
+                    current_lr = optimizer.param_groups[0].get("lr", None)
+                    if current_lr is not None:
+                        log_dict["train/learning_rate"] = current_lr
+
+                if grad_norm is not None:
+                    log_dict["train/grad_norm"] = grad_norm
+
+                accelerator.log(
+                    log_dict,
+                    step=state.global_step,
+                )
+
+                progress_bar.set_postfix(loss=f"{gathered_total:.4f}", lr=f"{current_lr:.2e}")
+
+
+            completed_steps += 1
+            state.global_step += 1
+            progress_bar.update(1)
+
+            for cb in callbacks:
+                try:
+                    cb.on_step_end(training_args, state, control, model=accelerator.unwrap_model(model))
+                except Exception as cb_err:
+                    logger.warning(f"Callback {cb.__class__.__name__} on_step_end failed: {cb_err}")
+
+            if training_args.do_eval and eval_dataloader is not None and eval_strategy == IntervalStrategy.STEPS and training_args.eval_steps and state.global_step % training_args.eval_steps == 0:
+                eval_metrics = _evaluate(model, eval_dataloader, accelerator, training_args, ema_cb, state, control)
+                if accelerator.is_main_process:
+                    accelerator.log(eval_metrics, step=state.global_step)
+
+            if save_strategy == IntervalStrategy.STEPS and training_args.save_steps and state.global_step % training_args.save_steps == 0:
+                ckpt_dir = os.path.join(training_args.output_dir, f"checkpoint-{state.global_step}")
+                _save_checkpoint(accelerator, model, training_args, ema_cb, state, control, ckpt_dir)
+
+            if completed_steps >= max_train_steps:
+                control.should_training_stop = True
+                break
+
+        if control.should_training_stop or completed_steps >= max_train_steps:
+            break
+
+        if training_args.do_eval and eval_dataloader is not None and eval_strategy == IntervalStrategy.EPOCH:
+            eval_metrics = _evaluate(model, eval_dataloader, accelerator, training_args, ema_cb, state, control)
+            if accelerator.is_main_process:
+                accelerator.log(eval_metrics, step=state.global_step)
+
+        if save_strategy == IntervalStrategy.EPOCH:
+            ckpt_dir = os.path.join(training_args.output_dir, f"checkpoint-epoch-{epoch + 1}")
+            _save_checkpoint(accelerator, model, training_args, ema_cb, state, control, ckpt_dir)
+
+    progress_bar.close()
+
+    for cb in callbacks:
+        try:
+            cb.on_train_end(training_args, state, control, model=accelerator.unwrap_model(model))
+        except Exception as cb_err:
+            logger.warning(f"Callback {cb.__class__.__name__} on_train_end failed: {cb_err}")
+
+    accelerator.wait_for_everyone()
+
+    if training_args.do_eval and eval_dataloader is not None:
+        final_eval = _evaluate(model, eval_dataloader, accelerator, training_args, ema_cb, state, control)
+        if accelerator.is_main_process:
+            accelerator.log(final_eval, step=state.global_step)
+
+    _save_checkpoint(accelerator, model, training_args, ema_cb, state, control, training_args.output_dir)
+
+    accelerator.end_training()
 
 
 if __name__ == "__main__":
