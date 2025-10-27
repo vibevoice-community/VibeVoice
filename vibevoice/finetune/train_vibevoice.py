@@ -225,10 +225,28 @@ def main() -> None:
         dtype = torch.bfloat16
     elif getattr(training_args, "fp16", False):
         dtype = torch.float16
-    model = VibeVoiceForConditionalGeneration.from_pretrained(
-        model_args.model_name_or_path,
-        torch_dtype=dtype,
-    )
+
+    # Try Flash Attention 2 first (faster and more stable), fallback to SDPA
+    attn_implementation = "flash_attention_2"
+    try:
+        logger.info(f"Attempting to load model with attn_implementation={attn_implementation}")
+        model = VibeVoiceForConditionalGeneration.from_pretrained(
+            model_args.model_name_or_path,
+            torch_dtype=dtype,
+            attn_implementation=attn_implementation,
+        )
+        logger.info(f"Successfully loaded model with Flash Attention 2")
+    except Exception as e:
+        logger.warning(f"Flash Attention 2 not available ({e}), falling back to SDPA")
+        logger.warning("Note: Flash Attention 2 is recommended for better performance and stability")
+        attn_implementation = "sdpa"
+        model = VibeVoiceForConditionalGeneration.from_pretrained(
+            model_args.model_name_or_path,
+            torch_dtype=dtype,
+            attn_implementation=attn_implementation,
+        )
+        logger.info(f"Loaded model with SDPA attention")
+
     _patch_acoustic_encode_for_legacy_indexing(model, logger)
     processor.semantic_tokenizer = getattr(model.model, "semantic_tokenizer", None)
 
