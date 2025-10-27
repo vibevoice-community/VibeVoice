@@ -74,6 +74,7 @@ def _load_diffusion_head(
     diff_dir = adapter_root / "diffusion_head"
     adapter_config = diff_dir / "adapter_config.json"
     adapter_model = diff_dir / "adapter_model.bin"
+    adapter_model_safetensors = diff_dir / "adapter_model.safetensors"
 
     try:
         from peft import PeftModel
@@ -82,7 +83,7 @@ def _load_diffusion_head(
             "peft is required to load diffusion head adapters but is not installed"
         ) from exc
 
-    if adapter_config.exists() and adapter_model.exists():
+    if adapter_config.exists() and (adapter_model.exists() or adapter_model_safetensors.exists()):
         logger.info(f"Loading diffusion head LoRA from {diff_dir}")
         shim = _DiffusionHeadForwardShim(model.model.prediction_head)
         peft_head = PeftModel.from_pretrained(shim, diff_dir)
@@ -113,7 +114,8 @@ def _load_language_model(
 ) -> None:
     config_file = adapter_root / "adapter_config.json"
     bin_file = adapter_root / "adapter_model.bin"
-    if not (config_file.exists() and bin_file.exists()):
+    safe_tensors_file = adapter_root / "adapter_model.safetensors"
+    if not (config_file.exists() and (bin_file.exists() or safe_tensors_file.exists())):
         return
 
     try:
