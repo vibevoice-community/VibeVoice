@@ -58,7 +58,7 @@ from .streamer import (
 
 # LoRA support
 from .lora_loading import (
-    load_lora_checkpoint,
+    load_lora_assets,
 )
 
 __all__ = [
@@ -92,5 +92,5 @@ __all__ = [
     "AudioStreamer",
     "AsyncAudioStreamer",
     # LoRA
-    "load_lora_checkpoint",
+    "load_lora_assets",
 ]

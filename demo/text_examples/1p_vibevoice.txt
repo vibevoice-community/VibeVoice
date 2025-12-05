@@ -1,0 +1,7 @@
+Hello and welcome! Today I'm going to tell you about VibeVoice, a groundbreaking text-to-speech model developed for generating natural, expressive speech.
+
+VibeVoice uses an innovative architecture combining autoregressive language modeling with diffusion-based audio generation. This allows it to produce remarkably natural-sounding speech with proper intonation and rhythm.
+
+The streaming version you're hearing right now is optimized for real-time applications, with low latency that makes it perfect for interactive use cases like virtual assistants and live applications.
+
+Thank you for listening to this demonstration!

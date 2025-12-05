@@ -127,8 +127,9 @@ python demo/streaming_inference_from_file.py \
     --ddpm_steps 5
 ```
 
-Voice presets are stored as `.pt` files in `demo/voices/streaming_model/`. These contain pre-computed KV cache embeddings for fast inference.
+Voice presets are stored as `.pt` files in `demo/voices/streaming_model/`. These contain pre-computed KV cache embeddings for fast inference. Voice cloning is not supported for now.
 
+NOTE: If you get the warning `Some weights of VibeVoiceStreamingForConditionalGenerationInference were not initialized from the model checkpoint` when loading, this is expected. This is because voice cloning capabilities have been removed from the model.
 
 ## [Finetuning](./FINETUNING.md)
 
