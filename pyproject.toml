@@ -36,6 +36,12 @@ dependencies = [
     "aiortc"
 ]
 
+[project.optional-dependencies]
+# Optional dependencies for streaming model web service
+streaming-web = [
+    "fastapi",
+    "uvicorn[standard]",
+]
 
 [project.urls]
 "Homepage" = "https://github.com/microsoft/VibeVoice"

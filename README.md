@@ -34,6 +34,7 @@ Fine-tuning is now supported, which is incredibly powerful. You can adapt VibeVo
 
 ## Updates
 
+- **[2025-12-04]** Added support for VibeVoice-Streaming-0.5B model for real-time TTS!
 - **[2025-09-05]** Microsoft repo restored (without code) with statement about responsible AI use.
 - **[2025-09-04]** Community backup created after Microsoft removed original repo and models.
 - **[2025-08-26]** The [VibeVoice-7B](https://huggingface.co/vibevoice/VibeVoice-7B) model weights are open-sourced!
@@ -47,10 +48,16 @@ Fine-tuning is now supported, which is incredibly powerful. You can adapt VibeVo
 
 ## Model Zoo
 
-| Model | Context Length | Generation Length |  Weight |
-|-------|----------------|----------|----------|
-| VibeVoice-1.5B | 64K | ~90 min | [HF link](https://huggingface.co/vibevoice/VibeVoice-1.5B) |
-| VibeVoice-Large| 32K | ~45 min | [HF link](https://huggingface.co/vibevoice/VibeVoice-7B) |
+| Model | Context Length | Generation Length | Speakers | Weight |
+|-------|----------------|-------------------|----------|--------|
+| VibeVoice-Streaming-0.5B | 8K | Real-time | 1 | [HF link](https://huggingface.co/microsoft/VibeVoice-Realtime-0.5B) |
+| VibeVoice-1.5B | 64K | ~90 min | Up to 4 | [HF link](https://huggingface.co/vibevoice/VibeVoice-1.5B) |
+| VibeVoice-Large (7B) | 32K | ~45 min | Up to 4 | [HF link](https://huggingface.co/vibevoice/VibeVoice-7B) |
+
+### Model Comparison
+
+- **VibeVoice-Streaming-0.5B**: Optimized for **real-time** low-latency TTS. Single speaker only. Uses pre-computed voice embeddings (.pt files) for fast inference. Best for live applications.
+- **VibeVoice-1.5B/7B**: Full-featured models for **long-form multi-speaker** content like podcasts. Support up to 4 speakers with voice cloning from audio samples.
 
 ## Installation
 
@@ -82,7 +89,7 @@ python demo/gradio_demo.py --model_path vibevoice/VibeVoice-1.5B --share
 # use the in-app "Disable voice cloning" setting (Advanced Settings) to skip speaker conditioning
 ```
 
-**Option 2: Inference from files directly**
+**Option 2: Inference from files directly (Multi-Speaker 1.5B/7B)**
 
 ```bash
 # We provide some LLM generated example scripts under demo/text_examples/ for demo
@@ -99,6 +106,30 @@ python demo/inference_from_file.py --model_path vibevoice/VibeVoice-7B --txt_pat
 python demo/inference_from_file.py --model_path vibevoice/VibeVoice-7B --txt_path demo/text_examples/1p_abs.txt --speaker_names Alice --disable_prefill
 ```
 
+**Option 3: Streaming Model (0.5B) - Real-time TTS**
+
+The streaming model uses pre-computed voice embeddings for low-latency generation:
+
+```bash
+# Basic usage with streaming model
+python demo/streaming_inference_from_file.py \
+    --model_path microsoft/VibeVoice-Realtime-0.5B \
+    --txt_path demo/text_examples/1p_vibevoice.txt \
+    --speaker_name Emma
+
+# Available voice presets: Carter, Davis, Emma, Frank, Grace, Mike (English), Samuel (Indian English)
+# Adjust CFG scale and DDPM steps for quality/speed tradeoff
+python demo/streaming_inference_from_file.py \
+    --model_path microsoft/VibeVoice-Realtime-0.5B \
+    --txt_path demo/text_examples/1p_vibevoice.txt \
+    --speaker_name Mike \
+    --cfg_scale 1.5 \
+    --ddpm_steps 5
+```
+
+Voice presets are stored as `.pt` files in `demo/voices/streaming_model/`. These contain pre-computed KV cache embeddings for fast inference. Voice cloning is not supported for now.
+
+NOTE: If you get the warning `Some weights of VibeVoiceStreamingForConditionalGenerationInference were not initialized from the model checkpoint` when loading, this is expected. This is because voice cloning capabilities have been removed from the model.
 
 ## [Finetuning](./FINETUNING.md)
 
