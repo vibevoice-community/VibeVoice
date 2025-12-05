@@ -40,8 +40,9 @@ from .modeling_vibevoice_streaming_inference import (
 
 # Shared components
 from .modular_vibevoice_tokenizer import (
-    VibeVoiceTokenizer,
     VibeVoiceTokenizerStreamingCache,
+    VibeVoiceAcousticTokenizerModel,
+    VibeVoiceSemanticTokenizerModel,
 )
 from .modular_vibevoice_text_tokenizer import (
     VibeVoiceTextTokenizer,
@@ -82,8 +83,9 @@ __all__ = [
     "TTS_TEXT_WINDOW_SIZE",
     "TTS_SPEECH_WINDOW_SIZE",
     # Shared components
-    "VibeVoiceTokenizer",
     "VibeVoiceTokenizerStreamingCache",
+    "VibeVoiceAcousticTokenizerModel",
+    "VibeVoiceSemanticTokenizerModel",
     "VibeVoiceTextTokenizer",
     "VibeVoiceTextTokenizerFast",
     "VibeVoiceDiffusionHead",
