@@ -31,7 +31,7 @@ dependencies = [
     "librosa",
     "ml-collections",
     "absl-py",
-    "gradio",
+    "gradio==5.50.0",
     "av",
     "aiortc"
 ]
