@@ -748,7 +748,7 @@ def create_demo_interface(demo_instance: VibeVoiceDemo):
                 with gr.Accordion("Generation Parameters", open=False):
                     cfg_scale = gr.Slider(
                         minimum=1.0,
-                        maximum=2.0,
+                        maximum=12.0,
                         value=1.3,
                         step=0.05,
                         label="CFG Scale (Guidance Strength)",
