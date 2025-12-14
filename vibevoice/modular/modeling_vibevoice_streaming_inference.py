@@ -55,6 +55,26 @@ def _check_prepare_cache_signature():
 
 _USES_NEW_PREPARE_CACHE = _check_prepare_cache_signature()
 
+
+def _ensure_cache_compat(cache):
+    if cache is None:
+        return cache
+
+    if not hasattr(cache, 'layers'):
+        if hasattr(cache, 'key_cache') and hasattr(cache, 'value_cache'):
+            object.__setattr__(cache, 'layers', list(zip(cache.key_cache, cache.value_cache)))
+        else:
+            object.__setattr__(cache, 'layers', [])
+
+    if not hasattr(cache, 'is_compileable'):
+        try:
+            object.__setattr__(cache, 'is_compileable', False)
+        except (AttributeError, TypeError):
+            pass
+
+    return cache
+
+
 if not hasattr(modeling_utils, "ALL_PARALLEL_STYLES") or modeling_utils.ALL_PARALLEL_STYLES is None:
     modeling_utils.ALL_PARALLEL_STYLES = ["tp", "none", "colwise", "rowwise"]
 
@@ -191,6 +211,11 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
 
     def set_ddpm_inference_steps(self, num_steps=None):
         self.ddpm_inference_steps = num_steps or self.config.diffusion_head_config.ddpm_num_inference_steps
+
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
+        if past_key_values is not None:
+            past_key_values = _ensure_cache_compat(past_key_values)
+        return super().prepare_inputs_for_generation(input_ids, past_key_values=past_key_values, **kwargs)
 
     def forward_lm(
         self,
@@ -376,6 +401,9 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
             self._prepare_cache_for_generation(
                 generation_config, model_kwargs, batch_size, max_cache_length
             )
+
+        if 'past_key_values' in model_kwargs and model_kwargs['past_key_values'] is not None:
+            model_kwargs['past_key_values'] = _ensure_cache_compat(model_kwargs['past_key_values'])
 
     def _build_generate_config_model_kwargs(self, generation_config, inputs, tokenizer, return_processors=False, **kwargs):
         if generation_config is None:
