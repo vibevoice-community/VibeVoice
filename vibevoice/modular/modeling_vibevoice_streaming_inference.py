@@ -27,6 +27,7 @@ from transformers import modeling_utils
 from transformers.modeling_utils import PreTrainedModel
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.utils import logging
+from transformers.generation.utils import GenerationMode
 
 from .modular_vibevoice_tokenizer import VibeVoiceTokenizerStreamingCache
 from .modular_vibevoice_diffusion_head import VibeVoiceDiffusionHead
@@ -354,24 +355,27 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
             else:
                 self.config.num_hidden_layers = 28
 
-        if _USES_NEW_PREPARE_CACHE:
-            try:
-                self._prepare_cache_for_generation(
-                    generation_config, model_kwargs, batch_size, max_cache_length, device, self.config
-                )
-            except TypeError:
-                self._prepare_cache_for_generation(
-                    generation_config, model_kwargs, None, batch_size, max_cache_length, device
-                )
+        import inspect
+        sig = inspect.signature(GenerationMixin._prepare_cache_for_generation)
+        params = list(sig.parameters.keys())
+
+        if 'generation_mode' in params and 'device' not in params:
+            generation_mode = GenerationMode.SAMPLE if getattr(generation_config, 'do_sample', False) else GenerationMode.GREEDY_SEARCH
+            self._prepare_cache_for_generation(
+                generation_config, model_kwargs, generation_mode, batch_size, max_cache_length
+            )
+        elif 'device' in params and 'assistant_model' in params:
+            self._prepare_cache_for_generation(
+                generation_config, model_kwargs, None, batch_size, max_cache_length, device
+            )
+        elif 'device' in params:
+            self._prepare_cache_for_generation(
+                generation_config, model_kwargs, batch_size, max_cache_length, device
+            )
         else:
-            try:
-                self._prepare_cache_for_generation(
-                    generation_config, model_kwargs, None, batch_size, max_cache_length, device
-                )
-            except TypeError:
-                self._prepare_cache_for_generation(
-                    generation_config, model_kwargs, batch_size, max_cache_length, device, self.config
-                )
+            self._prepare_cache_for_generation(
+                generation_config, model_kwargs, batch_size, max_cache_length
+            )
 
     def _build_generate_config_model_kwargs(self, generation_config, inputs, tokenizer, return_processors=False, **kwargs):
         if generation_config is None:
