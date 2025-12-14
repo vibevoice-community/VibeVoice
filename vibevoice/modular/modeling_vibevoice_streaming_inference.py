@@ -9,15 +9,11 @@ Key features:
 - Audio streaming support
 """
 
-import inspect
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union, Callable
 from tqdm import tqdm
 import torch
 import torch.nn as nn
-
-from packaging import version
-import transformers
 
 from transformers.models.auto import AutoModel, AutoModelForCausalLM
 
@@ -38,27 +34,12 @@ from .streamer import AudioStreamer, AsyncAudioStreamer
 
 logger = logging.get_logger(__name__)
 
-_TRANSFORMERS_VERSION = version.parse(transformers.__version__)
-_TRANSFORMERS_4_56 = version.parse("4.56.0")
-
-
-def _check_prepare_cache_signature():
-    try:
-        from transformers.generation import GenerationMixin
-        sig = inspect.signature(GenerationMixin._prepare_cache_for_generation)
-        params = list(sig.parameters.keys())
-        return 'model_config' in params or len(params) >= 7
-    except Exception:
-        return _TRANSFORMERS_VERSION >= _TRANSFORMERS_4_56
-
-
-_USES_NEW_PREPARE_CACHE = _check_prepare_cache_signature()
-
 if not hasattr(modeling_utils, "ALL_PARALLEL_STYLES") or modeling_utils.ALL_PARALLEL_STYLES is None:
     modeling_utils.ALL_PARALLEL_STYLES = ["tp", "none", "colwise", "rowwise"]
 
-TTS_TEXT_WINDOW_SIZE = 5
-TTS_SPEECH_WINDOW_SIZE = 6
+# Window sizes for streaming generation
+TTS_TEXT_WINDOW_SIZE = 5      # Process 5 text tokens at a time
+TTS_SPEECH_WINDOW_SIZE = 6    # Generate 6 speech frames per window
 
 
 def _update_model_kwargs_for_generation(
@@ -75,6 +56,7 @@ def _update_model_kwargs_for_generation(
       - cache_position: advance by creating a range for all new positions
     """
 
+    # update past_key_values keeping its naming used in model code
     model_kwargs["past_key_values"] = getattr(outputs, "past_key_values")
 
     attention_mask = model_kwargs["attention_mask"]
@@ -122,12 +104,16 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
     def __init__(self, config):
         super().__init__(config)
 
+        # Initialize the base model
         self.model = VibeVoiceStreamingModel(config)
 
+        # TTS generation EOS classifier
         self.tts_eos_classifier = BinaryClassifier(config.decoder_config.hidden_size)
 
+        # inference configuration
         self.ddpm_inference_steps = config.diffusion_head_config.ddpm_num_inference_steps
 
+        # Initialize weights and apply final processing
         self.post_init()
 
     @property
@@ -158,6 +144,7 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
         """
         Tie the weights between the input embeddings and the output embeddings.
         """
+        # Tie lm_head.weight to language_model.embed_tokens.weight
         if not getattr(self.config, 'tie_word_embeddings', False):
             return
 
@@ -225,6 +212,7 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # Get embeddings
         if inputs_embeds is None:
             inputs_embeds = self.model.get_input_embeddings()(input_ids)
 
@@ -291,12 +279,16 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # Get embeddings
         if inputs_embeds is None:
+            # Will be replaced with lm_last_hidden_state
             inputs_embeds = self.model.get_input_embeddings()(input_ids)
 
+        # Replace the last part of inputs_embeds with lm_last_hidden_state
         start_idx = inputs_embeds.shape[1] - lm_last_hidden_state.shape[1]
         inputs_embeds[:, start_idx:, :] = lm_last_hidden_state
 
+        # Adds type embedding via `tts_text_masks`.
         inputs_embeds = inputs_embeds + self.model.tts_input_types(tts_text_masks.long())
 
         outputs = self.model.tts_language_model(
@@ -344,34 +336,6 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
         raise RuntimeError(
             "Unified forward is disabled. Use `forward_lm`, `forward_tts_lm`, or `generate` instead."
         )
-
-    def _prepare_cache_for_generation_compat(self, generation_config, model_kwargs, batch_size, max_cache_length, device):
-        if not hasattr(self.config, 'num_hidden_layers'):
-            if hasattr(self.config, 'text_config') and hasattr(self.config.text_config, 'num_hidden_layers'):
-                self.config.num_hidden_layers = self.config.text_config.num_hidden_layers
-            elif hasattr(self.config, 'decoder_config') and hasattr(self.config.decoder_config, 'num_hidden_layers'):
-                self.config.num_hidden_layers = self.config.decoder_config.num_hidden_layers
-            else:
-                self.config.num_hidden_layers = 28
-
-        if _USES_NEW_PREPARE_CACHE:
-            try:
-                self._prepare_cache_for_generation(
-                    generation_config, model_kwargs, batch_size, max_cache_length, device, self.config
-                )
-            except TypeError:
-                self._prepare_cache_for_generation(
-                    generation_config, model_kwargs, None, batch_size, max_cache_length, device
-                )
-        else:
-            try:
-                self._prepare_cache_for_generation(
-                    generation_config, model_kwargs, None, batch_size, max_cache_length, device
-                )
-            except TypeError:
-                self._prepare_cache_for_generation(
-                    generation_config, model_kwargs, batch_size, max_cache_length, device, self.config
-                )
 
     def _build_generate_config_model_kwargs(self, generation_config, inputs, tokenizer, return_processors=False, **kwargs):
         if generation_config is None:
@@ -422,7 +386,7 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
         )
 
         max_cache_length = generation_config.max_length - 1
-        self._prepare_cache_for_generation_compat(generation_config, model_kwargs, batch_size, max_cache_length, device)
+        self._prepare_cache_for_generation(generation_config, model_kwargs, None, batch_size, max_cache_length, device)
         model_kwargs['cache_position'] = torch.arange(input_ids_length, device=device, dtype=torch.long)
         for k, v in model_kwargs.items():
             if isinstance(v, torch.Tensor):
@@ -477,7 +441,7 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
 
         The function only supports batch size = 1 currently.
 
-        - Windowed text prefill â†' incremental LM + TTS LM updates.
+        - Windowed text prefill → incremental LM + TTS LM updates.
         - Interleave speech token diffusion sampling (`sample_speech_tokens`).
         - Stops on EOS (binary classifier) or max length / external `stop_check_fn`.
         - Returns final token `sequences` and (optionally) concatenated speech audio.
@@ -498,11 +462,13 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
               - speech_outputs: list of concatenated audio tensors (or None)
               - reach_max_step_sample: flags for samples stopped by max length
         """
+        # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
         tokenizer = kwargs.pop("tokenizer", None)
         neg_text_input_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
 
         tts_lm_input_ids = kwargs.pop("tts_lm_input_ids", None)
         tts_lm_attention_mask = kwargs.pop("tts_lm_attention_mask", None)
+        # all_prefilled_outputs: cached prefilled prompt outputs for lm, tts_lm, neg_lm, neg_tts_lm
         all_prefilled_outputs = kwargs.pop("all_prefilled_outputs", None)
         tts_text_ids = tts_text_ids.to(self.device)
 
@@ -547,6 +513,7 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
         finished_tags = torch.zeros(batch_size, dtype=torch.bool, device=device)
         verbose = kwargs.get("verbose", False)
 
+        # Initialize audio chunks storage for each sample
         audio_chunks = [[] for _ in range(batch_size)]
         tts_text_window_index = 0
         reach_max_step_sample = torch.zeros(batch_size, dtype=torch.bool, device=device)
@@ -584,9 +551,11 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
             progress_bar = None
 
         while True:
+            # Check for external stop signal
             if stop_check_fn is not None and stop_check_fn():
                 if verbose:
                     print(f"Generation stopped externally at step {step + 1}")
+                # End the audio streamer if it exists
                 if audio_streamer is not None:
                     audio_streamer.end()
                 break
@@ -619,6 +588,7 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
                     progress_bar.set_description(f"Prefilled {total_prefilled_text_tokens} text tokens, generated {total_generated_speech_tokens} speech tokens, current step ({step} / {tts_lm_generation_config.max_length})")
 
                 model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+                # Forward pass through the model
                 outputs = self.forward_lm(
                     **model_inputs, return_dict=True, output_attentions=False, output_hidden_states=False,
                 )
@@ -631,6 +601,7 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
                     "tts_text_masks": torch.ones_like(tts_lm_input_ids[:, -1:]),
                     "lm_last_hidden_state": outputs.last_hidden_state,
                 }
+                # Forward pass through the model
                 tts_lm_outputs = self.forward_tts_lm(
                     **tts_lm_model_inputs, **tts_lm_additional_inputs, return_dict=True, output_attentions=False, output_hidden_states=False,
                 )
@@ -649,21 +620,26 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
                     cfg_scale=cfg_scale,
                 ).unsqueeze(1)
 
+                # Decode acoustic latent to audio using acoustic streaming cache
                 scaled_latent = speech_latent / self.model.speech_scaling_factor.to(speech_latent.device) - self.model.speech_bias_factor.to(speech_latent.device)
                 audio_chunk = self.model.acoustic_tokenizer.decode(
                     scaled_latent.to(self.model.acoustic_tokenizer.device),
-                    cache=acoustic_cache,
+                    cache=acoustic_cache,  # Use acoustic-specific cache
                     sample_indices=diffusion_indices.to(self.model.acoustic_tokenizer.device),
                     use_cache=True,
                     debug=False
                 )
 
+                # Store audio chunks for each sample
                 for i, sample_idx in enumerate(diffusion_indices):
                     idx = sample_idx.item()
+                    # Only append audio chunk if the sample is not finished
                     if not finished_tags[idx]:
                         audio_chunks[idx].append(audio_chunk[i])
 
+                # Add streaming support here
                 if audio_streamer is not None:
+                    # Stream the audio chunks immediately
                     audio_streamer.put(audio_chunk, diffusion_indices)
 
                 acoustic_embed = self.model.acoustic_connector(speech_latent)
@@ -683,6 +659,7 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
                     "tts_text_masks": torch.zeros_like(tts_lm_input_ids[:, -1:]),
                     "lm_last_hidden_state": acoustic_embed,
                 }
+                # Forward pass through the model
                 tts_lm_outputs = self.forward_tts_lm(
                     **tts_lm_model_inputs, **tts_lm_additional_inputs, return_dict=True, output_attentions=False, output_hidden_states=False,
                 )
@@ -697,6 +674,7 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
 
                 tts_lm_negative_input_ids = torch.cat([tts_lm_negative_input_ids, torch.ones_like(tts_lm_input_ids[:, -1:])], dim=-1)
                 tts_lm_negative_model_inputs = self.prepare_inputs_for_generation(tts_lm_negative_input_ids, **tts_lm_negative_model_kwargs)
+                # Forward negative pass through the model
                 tts_lm_negative_additional_inputs = {
                     "tts_text_masks": torch.zeros_like(tts_lm_negative_input_ids[:, -1:]),
                     "lm_last_hidden_state": acoustic_embed,
@@ -710,6 +688,7 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
 
                 tts_eos_logits = torch.sigmoid(self.tts_eos_classifier(tts_lm_outputs.last_hidden_state[diffusion_indices, -1, :]))
                 if tts_eos_logits[0].item() > 0.5:
+                    # If EOS token is predicted, we can stop generation for this sample
                     finished_tags[diffusion_indices] = True
                     if audio_streamer is not None:
                         audio_streamer.end(diffusion_indices)
@@ -725,12 +704,15 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
         if audio_streamer is not None:
             audio_streamer.end()
 
+        # Concatenate audio chunks for each sample
         final_audio_outputs = []
         for sample_chunks in audio_chunks:
             if sample_chunks:
+                # Concatenate all chunks along the time dimension (assumed to be the last dimension)
                 concatenated_audio = torch.cat(sample_chunks, dim=-1)
                 final_audio_outputs.append(concatenated_audio)
             else:
+                # If no audio was generated for this sample, append None
                 final_audio_outputs.append(None)
 
         if reach_max_step_sample is not None and reach_max_step_sample.any():
