@@ -19,6 +19,7 @@ import soundfile as sf
 import torch
 import os
 import traceback
+import re
 
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
@@ -210,6 +211,8 @@ class VibeVoiceDemo:
                                  speaker_3: str = None,
                                  speaker_4: str = None,
                                  cfg_scale: float = 1.3,
+                                 inference_steps: Optional[int] = None,
+                                 seed: Optional[int] = None,
                                  disable_voice_cloning: bool = False) -> Iterator[tuple]:
         try:
             
@@ -240,9 +243,37 @@ class VibeVoiceDemo:
             
             voice_cloning_enabled = not disable_voice_cloning
 
+            # Resolve per-run parameters
+            resolved_inference_steps = int(inference_steps) if inference_steps is not None else int(self.inference_steps)
+            resolved_seed: Optional[int]
+            if seed is None:
+                resolved_seed = None
+            else:
+                # Gradio Number may come through as float
+                resolved_seed = int(seed)
+                if resolved_seed < 0:
+                    resolved_seed = None
+
+            def _sanitize_filename_part(value: str, max_len: int = 60) -> str:
+                value = (value or "").strip()
+                value = re.sub(r"\s+", "_", value)
+                value = re.sub(r"[^A-Za-z0-9_\-\+\.]+", "", value)
+                return value[:max_len] if len(value) > max_len else value
+
+            def _write_complete_wav(audio_int16: np.ndarray, sample_rate: int = 24000) -> str:
+                ts = datetime.now().strftime("%Y%m%d%H%M%S")
+                speakers_part = _sanitize_filename_part("-".join(selected_speakers) if selected_speakers else "speaker")
+                cfg_part = _sanitize_filename_part(f"{cfg_scale:.2f}")
+                seed_part = str(resolved_seed) if resolved_seed is not None else "rand"
+                # Requested pattern: yyyyMMddhhmmss_[speaker]_[cfg_scale]_[inference_step][seed].wav
+                basename = f"{ts}_{speakers_part}_{cfg_part}_{resolved_inference_steps}_{seed_part}.wav"
+                out_path = os.path.join(tempfile.gettempdir(), basename)
+                sf.write(out_path, np.asarray(audio_int16, dtype=np.int16), sample_rate, subtype="PCM_16")
+                return out_path
+
             # Build initial log
             log = f"🎙️ Generating podcast with {num_speakers} speakers\n"
-            log += f"📊 Parameters: CFG Scale={cfg_scale}, Inference Steps={self.inference_steps}\n"
+            log += f"📊 Parameters: CFG Scale={cfg_scale}, Inference Steps={resolved_inference_steps}, Seed={(resolved_seed if resolved_seed is not None else 'random')}\n"
             log += f"🎭 Speakers: {', '.join(selected_speakers)}\n"
             log += f"🔊 Voice cloning: {'Enabled' if voice_cloning_enabled else 'Disabled'}\n"
             if self.loaded_adapter_root:
@@ -331,7 +362,7 @@ class VibeVoiceDemo:
             # Start generation in a separate thread
             generation_thread = threading.Thread(
                 target=self._generate_with_streamer,
-                args=(inputs, cfg_scale, audio_streamer, voice_cloning_enabled)
+                args=(inputs, cfg_scale, audio_streamer, voice_cloning_enabled, resolved_inference_steps, resolved_seed, target_device)
             )
             generation_thread.start()
             
@@ -465,8 +496,9 @@ class VibeVoiceDemo:
                 final_log += "✨ Generation successful! Complete audio is ready.\n"
                 final_log += "💡 Not satisfied? You can regenerate or adjust the CFG scale for different results."
                 
-                # Yield the complete audio
-                yield None, (sample_rate, complete_audio), final_log, gr.update(visible=False)
+                # Yield the complete audio as a filepath so download uses our filename
+                complete_wav_path = _write_complete_wav(complete_audio, sample_rate=sample_rate)
+                yield None, complete_wav_path, final_log, gr.update(visible=False)
                 return
             
             if not has_received_chunks:
@@ -490,8 +522,9 @@ class VibeVoiceDemo:
                 final_log += "✨ Generation successful! Complete audio is ready in the 'Complete Audio' tab.\n"
                 final_log += "💡 Not satisfied? You can regenerate or adjust the CFG scale for different results."
                 
-                # Final yield: Clear streaming audio and provide complete audio
-                yield None, (sample_rate, complete_audio), final_log, gr.update(visible=False)
+                # Final yield: Clear streaming audio and provide complete audio as filepath
+                complete_wav_path = _write_complete_wav(complete_audio, sample_rate=sample_rate)
+                yield None, complete_wav_path, final_log, gr.update(visible=False)
             else:
                 final_log = log + "❌ No audio was generated."
                 yield None, None, final_log, gr.update(visible=False)
@@ -513,17 +546,44 @@ class VibeVoiceDemo:
             traceback.print_exc()
             yield None, None, error_msg, gr.update(visible=False)
     
-    def _generate_with_streamer(self, inputs, cfg_scale, audio_streamer, voice_cloning_enabled: bool):
+    def _generate_with_streamer(
+        self,
+        inputs,
+        cfg_scale,
+        audio_streamer,
+        voice_cloning_enabled: bool,
+        inference_steps: int,
+        seed: Optional[int],
+        target_device: str,
+    ):
         """Helper method to run generation with streamer in a separate thread."""
         try:
             # Check for stop signal before starting generation
             if self.stop_generation:
                 audio_streamer.end()
                 return
+
+            # Apply per-run DDPM steps
+            try:
+                self.model.set_ddpm_inference_steps(num_steps=int(inference_steps))
+            except Exception as e:
+                print(f"Warning: failed to set inference steps ({inference_steps}): {e}")
                 
             # Define a stop check function that can be called from generate
             def check_stop_generation():
                 return self.stop_generation
+
+            generator = None
+            if seed is not None:
+                try:
+                    if target_device == "cuda":
+                        generator = torch.Generator(device="cuda")
+                    else:
+                        generator = torch.Generator()
+                    generator.manual_seed(int(seed))
+                except Exception as e:
+                    print(f"Warning: failed to create seeded generator (seed={seed}, device={target_device}): {e}")
+                    generator = None
                 
             outputs = self.model.generate(
                 **inputs,
@@ -533,6 +593,7 @@ class VibeVoiceDemo:
                 generation_config={
                     'do_sample': False,
                 },
+                generator=generator,
                 audio_streamer=audio_streamer,
                 stop_check_fn=check_stop_generation,  # Pass the stop check function
                 verbose=False,  # Disable verbose in streaming mode
@@ -687,12 +748,25 @@ def create_demo_interface(demo_instance: VibeVoiceDemo):
                 with gr.Accordion("Generation Parameters", open=False):
                     cfg_scale = gr.Slider(
                         minimum=1.0,
-                        maximum=2.0,
+                        maximum=12.0,
                         value=1.3,
                         step=0.05,
                         label="CFG Scale (Guidance Strength)",
                         # info="Higher values increase adherence to text",
                         elem_classes="slider-container"
+                    )
+                    inference_steps = gr.Slider(
+                        minimum=1,
+                        maximum=50,
+                        value=int(getattr(demo_instance, "inference_steps", 10)),
+                        step=1,
+                        label="Inference Steps",
+                        elem_classes="slider-container",
+                    )
+                    seed = gr.Number(
+                        value=42,
+                        precision=0,
+                        label="Seed (-1 = random)",
                     )
                     disable_voice_cloning = gr.Checkbox(
                         value=False,
@@ -782,7 +856,7 @@ Or paste text directly and it will auto-assign speakers.""",
                 # Complete audio output (non-streaming)
                 complete_audio_output = gr.Audio(
                     label="Complete Podcast (Download after generation)",
-                    type="numpy",
+                    type="filepath",
                     elem_classes="audio-output complete-audio-section",
                     streaming=False,  # Non-streaming mode
                     autoplay=False,
@@ -817,7 +891,7 @@ Or paste text directly and it will auto-assign speakers.""",
         )
         
         # Main generation function with streaming
-        def generate_podcast_wrapper(num_speakers, script, speaker_1, speaker_2, speaker_3, speaker_4, cfg_scale, disable_voice_cloning):
+        def generate_podcast_wrapper(num_speakers, script, speaker_1, speaker_2, speaker_3, speaker_4, cfg_scale, inference_steps, seed, disable_voice_cloning):
             """Wrapper function to handle the streaming generation call."""
             try:
                 speakers = [speaker_1, speaker_2, speaker_3, speaker_4]
@@ -836,6 +910,8 @@ Or paste text directly and it will auto-assign speakers.""",
                     speaker_3=speakers[2],
                     speaker_4=speakers[3],
                     cfg_scale=cfg_scale,
+                    inference_steps=inference_steps,
+                    seed=seed,
                     disable_voice_cloning=disable_voice_cloning
                 ):
                     final_log = log
@@ -884,7 +960,7 @@ Or paste text directly and it will auto-assign speakers.""",
             queue=False
         ).then(
             fn=generate_podcast_wrapper,
-            inputs=[num_speakers, script_input] + speaker_selections + [cfg_scale, disable_voice_cloning],
+            inputs=[num_speakers, script_input] + speaker_selections + [cfg_scale, inference_steps, seed, disable_voice_cloning],
             outputs=[audio_output, complete_audio_output, log_output, streaming_status, generate_btn, stop_btn],
             queue=True  # Enable Gradio's built-in queue
         )
