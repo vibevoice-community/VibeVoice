@@ -695,6 +695,12 @@ class VibeVoiceProcessor:
         """
         return self.audio_processor.save_audio(audio, output_path=output_path, sampling_rate=sampling_rate, normalize=normalize, batch_prefix=batch_prefix)
     
+    def push_to_hub(self, **kwargs):
+        """
+        Stub method for push to hub to make Unsloth happy.
+        """
+        raise NotImplementedError("Push to hub is not implemented for VibeVoiceProcessor")
+
 __all__ = [
     "VibeVoiceProcessor",
 ]
