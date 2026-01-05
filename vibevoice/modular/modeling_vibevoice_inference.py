@@ -6,7 +6,7 @@ import torch.nn as nn
 
 from transformers.models.auto import AutoModel, AutoModelForCausalLM
 
-from transformers.generation import GenerationMixin, GenerationConfig, LogitsProcessor, LogitsProcessorList, StoppingCriteriaList
+from transformers.generation import GenerationMixin, GenerationConfig, GenerationMode, LogitsProcessor, LogitsProcessorList, StoppingCriteriaList
 from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from transformers import modeling_utils
 from transformers.modeling_utils import PreTrainedModel
@@ -300,7 +300,9 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         )
 
         max_cache_length = generation_config.max_length - 1
-        self._prepare_cache_for_generation(generation_config, model_kwargs, None, batch_size, max_cache_length, device)
+        # Determine generation mode based on do_sample setting
+        generation_mode = GenerationMode.SAMPLE if generation_config.do_sample else GenerationMode.GREEDY_SEARCH
+        self._prepare_cache_for_generation(generation_config, model_kwargs, generation_mode, batch_size, max_cache_length)
         model_kwargs['cache_position'] = torch.arange(input_ids_length, device=device, dtype=torch.long)
         for k, v in model_kwargs.items():
             if isinstance(v, torch.Tensor):
