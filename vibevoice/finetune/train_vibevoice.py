@@ -26,7 +26,7 @@ from transformers.models.auto.processing_auto import PROCESSOR_MAPPING
 from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
 from transformers.models.qwen2.tokenization_qwen2 import Qwen2Tokenizer
 from transformers import TrainingArguments as HfTrainingArguments
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 
 from vibevoice.modular.modeling_vibevoice import VibeVoiceForConditionalGeneration
 from vibevoice.modular.configuration_vibevoice import (
@@ -156,8 +156,12 @@ class ModelArguments:
     train_diffusion_head: bool = field(default=False, metadata={"help": "Train diffusion prediction head (full fine-tune)"})
     train_connectors: bool = field(default=False, metadata={"help": "Train acoustic/semantic connectors (full fine-tune)"})
     layers_to_freeze: Optional[str] = field(
-        default=None, 
+        default=None,
         metadata={"help": "Comma-separated indices of diffusion head layers to freeze (e.g., '0,1,5,7,8')."}
+    )
+    load_in_4bit: bool = field(
+        default=False,
+        metadata={"help": "Load model in 4-bit quantization. Use with pre-quantized checkpoints (e.g., bnb-4bit)."}
     )
 
 @dataclass
@@ -326,7 +330,7 @@ def main() -> None:
             whisper_language="none",
             whisper_task="none",
             use_gradient_checkpointing = "unsloth" if training_args.gradient_checkpointing else False,
-            load_in_4bit = False
+            load_in_4bit = model_args.load_in_4bit,
     )
 
     _patch_acoustic_encode_for_legacy_indexing(model, logger)
@@ -432,6 +436,16 @@ def main() -> None:
     if model_args.freeze_semantic_tokenizer and hasattr(model.model, "semantic_tokenizer"):
         for p in model.model.semantic_tokenizer.parameters():
             p.requires_grad = False
+
+    # Prepare model for k-bit training if using 4-bit quantization
+    # Note: Unsloth already handles gradient checkpointing via use_gradient_checkpointing="unsloth"
+    # so we disable it here to avoid double setup
+    if model_args.load_in_4bit:
+        logger.info("Preparing language model for 4-bit training...")
+        model.model.language_model = prepare_model_for_kbit_training(
+            model.model.language_model,
+            use_gradient_checkpointing=False,  # Unsloth handles this
+        )
 
     # LoRA wrap LLM (optional)
     lora_cfg = build_lora_config(model_args)
