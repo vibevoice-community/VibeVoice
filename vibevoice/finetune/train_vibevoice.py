@@ -330,8 +330,25 @@ def main() -> None:
 
 
     # For DDP with quantized models, each rank must load the model on its own GPU
+    # For FSDP, load on CPU first (FSDP will handle GPU placement during wrapping)
+    # For DeepSpeed ZeRO-3, do NOT pass device_map (incompatible with Zero-3)
     # device_map={'': 0} means load all model on current device (managed by DDP)
-    device_map = {'': torch.cuda.current_device()} if torch.cuda.is_available() else None
+    use_fsdp = getattr(training_args, "fsdp", None) is not None and len(training_args.fsdp) > 0
+    use_deepspeed = getattr(training_args, "deepspeed", None) is not None
+
+    # For DeepSpeed Zero-3, temporarily hide GPUs during model loading to force CPU
+    # This avoids OOM during model initialization before sharding
+    if use_deepspeed:
+        import os
+        original_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+        os.environ['CUDA_VISIBLE_DEVICES'] = ''  # Hide all GPUs temporarily
+        device_map = None
+        logger.info("DeepSpeed detected: Hiding GPUs during model load to force CPU initialization")
+    elif use_fsdp:
+        device_map = "cpu"  # Load on CPU for FSDP
+        logger.info("FSDP detected: Loading model on CPU for memory-efficient wrapping")
+    else:
+        device_map = {'': torch.cuda.current_device()} if torch.cuda.is_available() else None
 
     model,tokenizer = FastLanguageModel.from_pretrained(
             model_args.model_name_or_path,
@@ -341,8 +358,16 @@ def main() -> None:
             whisper_task="none",
             use_gradient_checkpointing = "unsloth" if training_args.gradient_checkpointing else False,
             load_in_4bit = model_args.load_in_4bit,
-            device_map = device_map,  # Critical for DDP with quantized models
+            device_map = device_map,  # None for DeepSpeed, CPU for FSDP, GPU for DDP
     )
+
+    # Restore CUDA_VISIBLE_DEVICES for DeepSpeed
+    if use_deepspeed:
+        if original_visible_devices is not None:
+            os.environ['CUDA_VISIBLE_DEVICES'] = original_visible_devices
+        else:
+            del os.environ['CUDA_VISIBLE_DEVICES']
+        logger.info("Restored CUDA_VISIBLE_DEVICES for DeepSpeed training")
 
     _patch_acoustic_encode_for_legacy_indexing(model, logger)
     processor.semantic_tokenizer = getattr(model.model, "semantic_tokenizer", None)
@@ -505,14 +530,25 @@ def main() -> None:
     except Exception:
         pass
 
-    # DON'T freeze all parameters - LoRA params are already set above
-    # Just ensure non-LoRA language model params are frozen
-    try:
-        for n, p in model.model.language_model.named_parameters():
-            if "lora_" not in n:  # Freeze non-LoRA params
-                p.requires_grad = False
-    except Exception as e:
-        logger.warning(f"Could not freeze non-LoRA params on language_model: {e}")
+    # For full BF16 training (no LoRA), enable ALL parameters
+    # For LoRA training, freeze non-LoRA params
+    if skip_lm_lora:
+        # Full finetuning mode - enable all parameters and convert to BF16
+        logger.info("Full finetuning mode: Enabling all parameters and converting to BF16")
+        for n, p in model.named_parameters():
+            p.requires_grad = True
+            # Force all parameters to BF16 for true full BF16 training
+            if p.dtype not in (torch.bfloat16,) and p.dtype.is_floating_point:
+                p.data = p.data.to(torch.bfloat16)
+                logger.info(f"Converted {n} from {p.dtype} to BF16")
+    else:
+        # LoRA mode - freeze non-LoRA params
+        try:
+            for n, p in model.model.language_model.named_parameters():
+                if "lora_" not in n:  # Freeze non-LoRA params
+                    p.requires_grad = False
+        except Exception as e:
+            logger.warning(f"Could not freeze non-LoRA params on language_model: {e}")
 
     # Diffusion head LoRA wrapping (optional)
     if getattr(model_args, "lora_wrap_diffusion_head", False) and hasattr(model.model, "prediction_head"):
@@ -1042,6 +1078,7 @@ def main() -> None:
   
 
         def _save(self, output_dir: Optional[str] = None, state_dict=None) -> None:
+            import os
             try:
                 target_dir = output_dir or self.args.output_dir
                 lora_out = os.path.join(target_dir, "lora")
