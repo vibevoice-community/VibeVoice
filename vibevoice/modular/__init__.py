@@ -12,6 +12,12 @@ from .configuration_vibevoice import (
     VibeVoiceAcousticTokenizerConfig,
     VibeVoiceSemanticTokenizerConfig,
     VibeVoiceDiffusionHeadConfig,
+    VibeVoiceASRConfig,
+)
+from .modeling_vibevoice_asr import (
+    VibeVoiceASRPreTrainedModel,
+    VibeVoiceASRModel,
+    VibeVoiceASRForConditionalGeneration,
 )
 from .modeling_vibevoice import (
     VibeVoicePreTrainedModel,
@@ -67,10 +73,15 @@ __all__ = [
     "VibeVoiceAcousticTokenizerConfig",
     "VibeVoiceSemanticTokenizerConfig",
     "VibeVoiceDiffusionHeadConfig",
+    "VibeVoiceASRConfig",
     # Multi-speaker models
     "VibeVoicePreTrainedModel",
     "VibeVoiceModel",
     "VibeVoiceForConditionalGenerationInference",
+    # ASR models
+    "VibeVoiceASRPreTrainedModel",
+    "VibeVoiceASRModel",
+    "VibeVoiceASRForConditionalGeneration",
     # Streaming configs
     "VibeVoiceStreamingConfig",
     # Streaming models
