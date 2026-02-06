@@ -176,3 +176,8 @@ tags
 exp
 .gradio/
 MSFT-VV
+
+# trained models and checkpoints
+heiertech/
+inference_outputs/
+unsloth_compiled_cache/

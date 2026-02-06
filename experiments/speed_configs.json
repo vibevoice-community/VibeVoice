@@ -1,0 +1,26 @@
+[
+  {
+    "batch_size": 4,
+    "grad_accum": 16,
+    "lora_r": 16,
+    "ddpm_mul": 4
+  },
+  {
+    "batch_size": 6,
+    "grad_accum": 16,
+    "lora_r": 16,
+    "ddpm_mul": 4
+  },
+  {
+    "batch_size": 8,
+    "grad_accum": 12,
+    "lora_r": 16,
+    "ddpm_mul": 4
+  },
+  {
+    "batch_size": 8,
+    "grad_accum": 8,
+    "lora_r": 16,
+    "ddpm_mul": 6
+  }
+]
