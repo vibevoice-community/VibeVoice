@@ -191,7 +191,7 @@ def parse_args():
     parser.add_argument(
     "--seed",
     type=int,
-    default=None,
+    default=42,
     help="Random seed for reproducibility (optional)",
 )
     return parser.parse_args()
@@ -281,15 +281,15 @@ def main():
 
 
     # Decide dtype & attention implementation
-    if args.device == "mps":
-        load_dtype = torch.float32  # MPS requires float32
-        attn_impl_primary = "sdpa"  # flash_attention_2 not supported on MPS
-    elif args.device == "cuda":
-        load_dtype = torch.bfloat16
-        attn_impl_primary = "flash_attention_2"
-    else:  # cpu
-        load_dtype = torch.float32
-        attn_impl_primary = "sdpa"
+    # if args.device == "mps":
+    #     load_dtype = torch.float32  # MPS requires float32
+    #     attn_impl_primary = "sdpa"  # flash_attention_2 not supported on MPS
+    # elif args.device == "cuda":
+    load_dtype = torch.bfloat16
+    attn_impl_primary = "flash_attention_2"
+    # else:  # cpu
+    #     load_dtype = torch.float32
+    #     attn_impl_primary = "sdpa"
     print(f"Using device: {args.device}, torch_dtype: {load_dtype}, attn_implementation: {attn_impl_primary}")
     # Load model with device-specific logic
     try:
@@ -362,7 +362,7 @@ def main():
         print("Voice cloning enabled: running generation with is_prefill=True")
 
     model.eval()
-    model.set_ddpm_inference_steps(num_steps=10)
+    model.set_ddpm_inference_steps(num_steps=30)
 
     if hasattr(model.model, 'language_model'):
        print(f"Language model attention: {model.model.language_model.config._attn_implementation}")
