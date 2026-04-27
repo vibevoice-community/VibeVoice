@@ -192,25 +192,19 @@ def max_corr_with_lag(a: np.ndarray, b: np.ndarray, max_lag_samples: int) -> flo
     length = min(len(a), len(b))
     if length < 16:
         return 0.0
-    a = safe_unit_norm(a[:length] - np.mean(a[:length]))
-    b = safe_unit_norm(b[:length] - np.mean(b[:length]))
-    best = -1.0
-    for lag in range(-max_lag_samples, max_lag_samples + 1):
-        if lag < 0:
-            x = a[-lag:]
-            y = b[: len(x)]
-        elif lag > 0:
-            x = a[:-lag]
-            y = b[lag : lag + len(x)]
-        else:
-            x = a
-            y = b
-        if len(x) < 16 or len(y) < 16:
-            continue
-        score = float(np.dot(safe_unit_norm(x), safe_unit_norm(y)))
-        if score > best:
-            best = score
-    return max(best, 0.0)
+    a = a[:length] - np.mean(a[:length])
+    b = b[:length] - np.mean(b[:length])
+    a_norm = np.linalg.norm(a)
+    b_norm = np.linalg.norm(b)
+    if a_norm <= 1e-12 or b_norm <= 1e-12:
+        return 0.0
+    corr = signal.correlate(a, b, mode="full", method="fft") / (a_norm * b_norm)
+    center = len(corr) // 2
+    start = max(0, center - max_lag_samples)
+    end = min(len(corr), center + max_lag_samples + 1)
+    if start >= end:
+        return 0.0
+    return max(float(np.max(corr[start:end])), 0.0)
 
 
 def band_limited(audio: np.ndarray, sample_rate: int, highpass_hz: float) -> np.ndarray:
@@ -246,9 +240,16 @@ def spectral_fingerprint(
         return np.zeros(16, dtype=np.float32)
     mean_spectrum = np.mean(band, axis=1)
     log_spec = np.log1p(mean_spectrum)
-    if np.max(log_spec) > 0:
-        log_spec = log_spec / np.max(log_spec)
-    return log_spec.astype(np.float32)
+    if log_spec.size >= 9:
+        smooth = signal.savgol_filter(log_spec, window_length=9, polyorder=2, mode="interp")
+    else:
+        smooth = log_spec
+    residual = log_spec - smooth
+    residual = residual - np.mean(residual)
+    norm = np.linalg.norm(residual)
+    if norm <= 1e-12:
+        return np.zeros_like(residual, dtype=np.float32)
+    return (residual / norm).astype(np.float32)
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
