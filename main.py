@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model_path",
         type=str,
-        default="vibevoice/VibeVoice-4bit",
+        default="vibevoice/VibeVoice-1.5B",
         help="Local model directory.",
     )
     parser.add_argument(
@@ -57,13 +57,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cfg_scale",
         type=float,
-        default=1.3,
+        default=2.0,
         help="Classifier-free guidance scale.",
     )
     parser.add_argument(
         "--use_compile",
         action="store_true",
         help="Compile the language model path for repeated non-quantized inference.",
+    )
+    parser.add_argument(
+        "--enhance_audio",
+        action="store_true",
+        help="Enable peak-normalized voice enhancement when saving audio.",
     )
     return parser
 
@@ -202,7 +207,11 @@ def run_batch_tts() -> None:
             output_dir = os.path.dirname(output_path)
             if output_dir:
                 os.makedirs(output_dir, exist_ok=True)
-            processor.save_audio(outputs.speech_outputs[0], output_path=output_path)
+            processor.save_audio(
+                outputs.speech_outputs[0],
+                output_path=output_path,
+                normalize=args.enhance_audio,
+            )
 
             sample_rate = 24000
             audio_samples = outputs.speech_outputs[0].shape[-1]
@@ -212,6 +221,7 @@ def run_batch_tts() -> None:
                 f"Saved audio. generation_time={generation_time:.2f}s, "
                 f"audio_duration={audio_duration:.2f}s, RTF={rtf:.2f}x"
             )
+            print(f"Voice enhancement: {'on' if args.enhance_audio else 'off'}")
         except Exception as exc:
             print(f"Task failed: {exc}")
             traceback.print_exc()

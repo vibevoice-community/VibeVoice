@@ -60,3 +60,5 @@ $env:PATH='C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin;' + $env
 - The first `flash_attention_2` run can be much slower because Triton may compile kernels on first use.
 - After warmup, `flash_attention_2` was slightly faster than `sdpa` on this machine.
 - Output audio files are saved to `outputs/`.
+
+python .\mainsteam.py --model_path microsoft/VibeVoice-Realtime-0.5B --txt_path demo/text_examples/1p_vibevoice.txt --speaker_name Carter
