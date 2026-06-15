@@ -352,6 +352,8 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
         ddpm_batch_mul: int = 1,
         **kwargs: Optional[Dict[str, Union[torch.Tensor, str]]],
         ) -> Union[Tuple, VibeVoiceCausalLMOutputWithPast]:
+        if input_ids is None:
+            return 
         
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
