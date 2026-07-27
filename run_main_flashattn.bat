@@ -4,13 +4,13 @@ setlocal
 set "REPO_ROOT=%~dp0"
 cd /d "%REPO_ROOT%"
 
-set "PYTHON_EXE=%REPO_ROOT%\.venv311fa\Scripts\python.exe"
+set "PYTHON_EXE=%REPO_ROOT%\.venv311accel\Scripts\python.exe"
 if not exist "%PYTHON_EXE%" (
-  echo Missing .venv311fa. Please recreate the flash-attn environment first.
+  echo Missing .venv311accel. Please recreate the acceleration environment first.
   exit /b 1
 )
 
-set "CUDA_ROOT=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+set "CUDA_ROOT=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1"
 if exist "%CUDA_ROOT%" (
   set "CUDA_HOME=%CUDA_ROOT%"
   set "CUDA_PATH=%CUDA_ROOT%"

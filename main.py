@@ -3,6 +3,30 @@ import json
 import os
 import time
 import traceback
+import sys
+import subprocess
+
+
+def _relaunch_in_acceleration_env() -> None:
+    if os.environ.get('VIBEVOICE_DISABLE_ACCEL_REEXEC') == '1':
+        return
+    if os.environ.get('VIBEVOICE_ACCEL_REEXEC') == '1':
+        return
+
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    preferred_python = os.path.join(script_dir, '.venv311accel', 'Scripts', 'python.exe')
+    if not os.path.isfile(preferred_python):
+        return
+    if os.path.normcase(os.path.realpath(sys.executable)) == os.path.normcase(os.path.realpath(preferred_python)):
+        return
+
+    os.environ['VIBEVOICE_ACCEL_REEXEC'] = '1'
+    completed = subprocess.run([preferred_python, os.path.realpath(__file__), *sys.argv[1:]], env=os.environ.copy())
+    raise SystemExit(completed.returncode)
+
+
+if __name__ == '__main__':
+    _relaunch_in_acceleration_env()
 
 import torch
 
@@ -11,7 +35,7 @@ from vibevoice.acceleration import (
     build_model_load_kwargs,
     configure_torch_runtime,
     format_dtype,
-    maybe_compile_language_model,
+    maybe_compile_prediction_head,
 )
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
@@ -69,13 +93,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--use_compile",
         action="store_true",
-        help="Compile the language model path for repeated non-quantized inference.",
+        help="Compile and warm the diffusion prediction head (enabled by default).",
     )
     parser.add_argument(
         "--enhance_audio",
         action="store_true",
         help="Enable peak-normalized voice enhancement when saving audio.",
     )
+    parser.add_argument(
+        '--no_compile',
+        action='store_false',
+        dest='use_compile',
+        help='Disable prediction-head compilation.',
+    )
+    parser.set_defaults(use_compile=True)
     return parser
 
 
@@ -133,7 +164,7 @@ def run_batch_tts() -> None:
         model = VibeVoiceForConditionalGenerationInference.from_pretrained(model_path, **load_kwargs)
         model.eval()
         model.set_ddpm_inference_steps(num_steps=args.ddpm_steps)
-        model, compile_status = maybe_compile_language_model(model, args.use_compile)
+        model, compile_status = maybe_compile_prediction_head(model, args.use_compile)
         print(
             "Model loaded."
             f" attn={load_meta['attn_impl']} ({load_meta['attn_reason']})"

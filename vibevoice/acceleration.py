@@ -146,5 +146,38 @@ def maybe_compile_language_model(model: Any, enabled: bool) -> Tuple[Any, str]:
     return model, "compiled"
 
 
+def maybe_compile_prediction_head(model: Any, enabled: bool) -> Tuple[Any, str]:
+    if not enabled:
+        return model, 'disabled'
+
+    prediction_head = getattr(getattr(model, 'model', None), 'prediction_head', None)
+    if prediction_head is None:
+        return model, 'prediction head not found'
+    if not module_available('triton'):
+        return model, 'skipped: triton not installed'
+
+    compile_fn = getattr(torch, 'compile', None)
+    if not callable(compile_fn):
+        return model, 'skipped: torch.compile unavailable'
+
+    try:
+        compiled_head = compile_fn(prediction_head, mode='reduce-overhead')
+        model.model.prediction_head = compiled_head
+
+        parameter = next(prediction_head.parameters())
+        config = prediction_head.config
+        noisy = torch.zeros(2, config.latent_size, device=parameter.device, dtype=parameter.dtype)
+        timesteps = torch.zeros(2, device=parameter.device, dtype=parameter.dtype)
+        condition = torch.zeros(2, config.hidden_size, device=parameter.device, dtype=parameter.dtype)
+        with torch.inference_mode():
+            compiled_head(noisy, timesteps, condition=condition)
+        if parameter.device.type == 'cuda':
+            torch.cuda.synchronize(parameter.device)
+    except Exception as exc:
+        model.model.prediction_head = prediction_head
+        return model, f'skipped: prediction head compile failed ({exc.__class__.__name__})'
+    return model, 'compiled and warmed prediction head'
+
+
 def format_dtype(dtype: torch.dtype) -> str:
     return str(dtype).replace("torch.", "")

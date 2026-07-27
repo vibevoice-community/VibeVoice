@@ -12,10 +12,15 @@ from vibevoice.acceleration import (
     build_model_load_kwargs,
     configure_torch_runtime,
     format_dtype,
-    maybe_compile_language_model,
+    maybe_compile_prediction_head,
 )
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
+
+
+BENCH_CFG_SCALE = 2.0
+BENCH_PROFILE_STAGES = False
+BENCH_SEED = 42
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,10 +30,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text", required=True, help="Input text.")
     parser.add_argument("--attn", default="sdpa", choices=["auto", "sdpa", "flash_attention_2", "eager"])
     parser.add_argument("--ddpm-steps", type=int, nargs="+", default=[10, 8])
-    parser.add_argument("--compile", action="store_true", help="Compile the language model for repeated runs.")
+    parser.add_argument("--compile", action="store_true", help="Compile and warm the diffusion prediction head.")
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--timed-runs", type=int, default=1)
     parser.add_argument("--json-out", type=Path, default=None)
+    parser.add_argument('--cfg-scale', type=float, default=2.0)
+    parser.add_argument('--profile-stages', action='store_true')
+    parser.add_argument('--seed', type=int, default=42)
     return parser.parse_args()
 
 
@@ -47,6 +55,9 @@ def prepare_inputs(processor: VibeVoiceProcessor, text: str, voice: str, device:
 
 
 def run_once(model, processor, inputs, use_autocast: bool, autocast_dtype: torch.dtype) -> tuple[float, float]:
+    torch.manual_seed(BENCH_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(BENCH_SEED)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     start = time.time()
@@ -56,22 +67,24 @@ def run_once(model, processor, inputs, use_autocast: bool, autocast_dtype: torch
             with torch.amp.autocast("cuda", dtype=autocast_dtype):
                 outputs = model.generate(
                     **inputs,
-                    cfg_scale=1.3,
+                    cfg_scale=BENCH_CFG_SCALE,
+                    profile_stages=BENCH_PROFILE_STAGES,
                     tokenizer=processor.tokenizer,
                     generation_config={"do_sample": False},
-                    is_prefill=True,
                     max_new_tokens=None,
+                    is_prefill=True,
                     verbose=False,
                     show_progress_bar=False,
                 )
         else:
             outputs = model.generate(
                 **inputs,
-                cfg_scale=1.3,
+                cfg_scale=BENCH_CFG_SCALE,
+                profile_stages=BENCH_PROFILE_STAGES,
                 tokenizer=processor.tokenizer,
                 generation_config={"do_sample": False},
-                is_prefill=True,
                 max_new_tokens=None,
+                is_prefill=True,
                 verbose=False,
                 show_progress_bar=False,
             )
@@ -84,7 +97,11 @@ def run_once(model, processor, inputs, use_autocast: bool, autocast_dtype: torch
 
 
 def main() -> int:
+    global BENCH_CFG_SCALE, BENCH_PROFILE_STAGES, BENCH_SEED
     args = parse_args()
+    BENCH_CFG_SCALE = args.cfg_scale
+    BENCH_PROFILE_STAGES = args.profile_stages
+    BENCH_SEED = args.seed
     configure_torch_runtime()
 
     model_path = Path(args.model_path).resolve()
@@ -102,7 +119,7 @@ def main() -> int:
     )
     model = VibeVoiceForConditionalGenerationInference.from_pretrained(model_path.as_posix(), **load_kwargs)
     model.eval()
-    model, compile_status = maybe_compile_language_model(model, args.compile)
+    model, compile_status = maybe_compile_prediction_head(model, args.compile)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     inputs = prepare_inputs(processor, args.text, voice_path.as_posix(), device)
@@ -120,14 +137,30 @@ def main() -> int:
             run_once(model, processor, inputs, use_autocast, load_meta["torch_dtype"])
 
         elapsed_values = []
+        stage_profiles = []
         audio_duration = None
         for _ in range(args.timed_runs):
             elapsed, audio_duration = run_once(model, processor, inputs, use_autocast, load_meta["torch_dtype"])
             elapsed_values.append(elapsed)
+            stage_profile = getattr(model, '_last_profile', None)
+            if stage_profile:
+                stage_profiles.append(stage_profile)
 
         avg_elapsed = sum(elapsed_values) / len(elapsed_values)
         rtf = avg_elapsed / audio_duration if audio_duration else float("inf")
+        stage_seconds = None
+        if stage_profiles:
+            stage_names = sorted({name for profile in stage_profiles for name in profile})
+            stage_seconds = {
+                name: round(sum(profile.get(name, 0.0) for profile in stage_profiles) / len(stage_profiles), 4)
+                for name in stage_names
+            }
+            tracked_total = sum(stage_seconds.values())
+            stage_seconds['tracked_total'] = round(tracked_total, 4)
+            stage_seconds['untracked_wall'] = round(max(0.0, avg_elapsed - tracked_total), 4)
         row = {
+            'cfg_scale': args.cfg_scale,
+            'stage_seconds': stage_seconds,
             "model": model_path.name,
             "ddpm_steps": ddpm_steps,
             "attn_impl": load_meta["attn_impl"],
@@ -138,6 +171,8 @@ def main() -> int:
             "rtf": round(rtf, 3),
         }
         results.append(row)
+        if stage_seconds:
+            print(f'stage_seconds={stage_seconds}')
         print(
             f"ddpm={ddpm_steps}: avg_generation={row['avg_generation_sec']}s, "
             f"audio_duration={row['audio_duration_sec']}s, rtf={row['rtf']}x"

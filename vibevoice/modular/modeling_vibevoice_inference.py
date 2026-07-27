@@ -363,6 +363,23 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         Returns:
             Generated token sequences and optionally speech outputs
         """
+        profile_stages = bool(kwargs.pop('profile_stages', False))
+        profile_events = {} if profile_stages and torch.cuda.is_available() else None
+
+        def profile_begin():
+            if profile_events is None:
+                return None
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            return event
+
+        def profile_end(name, start):
+            if start is None:
+                return
+            end = torch.cuda.Event(enable_timing=True)
+            end.record()
+            profile_events.setdefault(name, []).append((start, end))
+
         # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
         tokenizer = kwargs.pop("tokenizer", None)  # Pull this out first, we only use it for stopping criteria
         parsed_scripts = kwargs.pop("parsed_scripts", None)
@@ -479,9 +496,11 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                 prefill_inputs = {'inputs_embeds': inputs_embeds}
 
             # Forward pass through the model
+            profile_event = profile_begin()
             outputs = self(
                 **model_inputs, **prefill_inputs, logits_to_keep=1, return_dict=True, output_attentions=False, output_hidden_states=False,
             )
+            profile_end('positive_model', profile_event)
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=False,
             )
@@ -509,9 +528,11 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                     negative_model_inputs['inputs_embeds'] = inputs_embeds
                     negative_model_inputs['input_ids'] = None
 
+                profile_event = profile_begin()
                 negative_outputs = self(
                     **negative_model_inputs, logits_to_keep=0, return_dict=True, output_attentions=False, output_hidden_states=False,
                 )
+                profile_end('negative_model', profile_event)
                 negative_model_kwargs = self._update_model_kwargs_for_generation(
                     negative_outputs, negative_model_kwargs, is_encoder_decoder=False,
                 )
@@ -582,9 +603,11 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                         negative_model_inputs['inputs_embeds'] = inputs_embeds
                         negative_model_inputs['input_ids'] = None
 
+                    profile_event = profile_begin()
                     negative_outputs = self(
                         **negative_model_inputs, logits_to_keep=0, return_dict=True, output_attentions=False, output_hidden_states=False,
                     )
+                    profile_end('negative_model', profile_event)
                     negative_model_kwargs = self._update_model_kwargs_for_generation(
                         negative_outputs, negative_model_kwargs, is_encoder_decoder=False,
                     )
@@ -594,7 +617,7 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                 #   they are not in diffusion mode to keep the cache consistent
                 # So we need to correct the kv cache of non-diffusion samples
                 non_diffusion_mask = ~finished_tags & (next_tokens != generation_config.speech_diffusion_id)
-                if non_diffusion_mask.any():
+                if batch_size > 1 and non_diffusion_mask.any():
                     non_diffusion_indices = torch.arange(batch_size, device=device)[non_diffusion_mask]
                     start_indices = correct_cnt[non_diffusion_indices]
 
@@ -628,28 +651,33 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                 positive_condition = outputs.last_hidden_state[diffusion_indices, -1, :]
                 negative_condition = negative_outputs.last_hidden_state[diffusion_indices, -1, :]
                 
+                profile_event = profile_begin()
                 speech_latent = self.sample_speech_tokens(
                     positive_condition,
                     negative_condition,
                     cfg_scale=cfg_scale,
                 ).unsqueeze(1)
+                profile_end('diffusion', profile_event)
                                 
                 # Decode acoustic latent to audio using acoustic streaming cache
                 scaled_latent = speech_latent / self.model.speech_scaling_factor.to(speech_latent.device) - self.model.speech_bias_factor.to(speech_latent.device)
+                if batch_size == 1:
+                    cache_indices = torch.zeros(1, dtype=torch.long)
+                else:
+                    cache_indices = diffusion_indices.detach().cpu()
+                profile_event = profile_begin()
                 audio_chunk = self.model.acoustic_tokenizer.decode(
                     scaled_latent.to(self.model.acoustic_tokenizer.device),
                     cache=acoustic_cache,  # Use acoustic-specific cache
-                    sample_indices=diffusion_indices.to(self.model.acoustic_tokenizer.device),
+                    sample_indices=cache_indices,
                     use_cache=True,
                     debug=False
                 )
+                profile_end('acoustic_decode', profile_event)
                 
                 # Store audio chunks for each sample
-                for i, sample_idx in enumerate(diffusion_indices):
-                    idx = sample_idx.item()
-                    # Only append audio chunk if the sample is not finished
-                    if not finished_tags[idx]:
-                        audio_chunks[idx].append(audio_chunk[i])
+                for i, idx in enumerate(cache_indices.tolist()):
+                    audio_chunks[idx].append(audio_chunk[i])
 
                  # Add streaming support here
                 if audio_streamer is not None:
@@ -657,13 +685,15 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                     audio_streamer.put(audio_chunk, diffusion_indices)
                     
                 # Encode audio to semantic features using semantic streaming cache
+                profile_event = profile_begin()
                 semantic_features = self.model.semantic_tokenizer.encode(
                     audio_chunk,
                     cache=semantic_cache,  # Use semantic-specific cache
-                    sample_indices=diffusion_indices,
+                    sample_indices=cache_indices,
                     use_cache=True,
                     debug=False
                 ).mean # semantic tokenizer has no VAE.
+                profile_end('semantic_encode', profile_event)
                 
                 # Combine acoustic and semantic features for next input
                 acoustic_embed = self.model.acoustic_connector(speech_latent)
@@ -689,6 +719,15 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
             else:
                 # If no audio was generated for this sample, append None
                 final_audio_outputs.append(None)
+
+        if profile_events is not None:
+            torch.cuda.synchronize()
+            self._last_profile = {
+                name: sum(start.elapsed_time(end) for start, end in events) / 1000.0
+                for name, events in profile_events.items()
+            }
+        else:
+            self._last_profile = None
 
         return VibeVoiceGenerationOutput(
             sequences=input_ids,
