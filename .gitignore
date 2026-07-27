@@ -176,3 +176,8 @@ tags
 exp
 .gradio/
 MSFT-VV
+/vibevoice/VibeVoice-Large
+/vibevoice/VibeVoice-0.5b
+/vibevoice/VibeVoice-1.5B
+/vibevoice/VibeVoice-4bit
+/vibevoice/VibeVoice-7B

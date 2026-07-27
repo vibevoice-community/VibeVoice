@@ -38,7 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model_path",
         type=str,
-        default="vibevoice/VibeVoice-1.5B",
+        # default="vibevoice/VibeVoice-1.5B",
+        default="vibevoice/VibeVoice-4bit",
         help="Local model directory.",
     )
     parser.add_argument(
@@ -47,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         choices=["auto", "sdpa", "flash_attention_2", "eager"],
         help="Attention backend to use.",
+    )
+    parser.add_argument(
+        "--use_4bit",
+        action="store_true",
+        help="Load model with 4-bit quantization (bitsandbytes). Auto-detected for pre-quantized models.",
     )
     parser.add_argument(
         "--ddpm_steps",
@@ -121,7 +127,7 @@ def run_batch_tts() -> None:
         processor = VibeVoiceProcessor.from_pretrained(model_path)
         load_kwargs, load_meta = build_model_load_kwargs(
             model_path=model_path,
-            use_4bit=False,
+            use_4bit=args.use_4bit,
             attn_impl=args.attn_impl,
         )
         model = VibeVoiceForConditionalGenerationInference.from_pretrained(model_path, **load_kwargs)
