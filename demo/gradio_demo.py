@@ -24,6 +24,7 @@ import re
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
 from vibevoice.modular.lora_loading import load_lora_assets
+from vibevoice.processor.script_formatting import format_conversation_script
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 from vibevoice.modular.streamer import AudioStreamer
 from transformers.utils import logging
@@ -305,25 +306,16 @@ class VibeVoiceDemo:
                 yield None, "🛑 Generation stopped by user", gr.update(visible=False)
                 return
             
-            # Parse script to assign speaker ID's
-            lines = script.strip().split('\n')
-            formatted_script_lines = []
-            
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                    
-                # Check if line already has speaker format
-                if line.startswith('Speaker ') and ':' in line:
-                    formatted_script_lines.append(line)
-                else:
-                    # Auto-assign to speakers in rotation
-                    speaker_id = len(formatted_script_lines) % num_speakers
-                    formatted_script_lines.append(f"Speaker {speaker_id}: {line}")
-            
-            formatted_script = '\n'.join(formatted_script_lines)
-            log += f"📝 Formatted script with {len(formatted_script_lines)} turns\n\n"
+            # Only explicit labels change speakers. Unlabeled paragraphs continue
+            # the current turn, with Speaker 1 as the initial default.
+            try:
+                formatted_script = format_conversation_script(script, num_speakers)
+            except ValueError as error:
+                self.is_generating = False
+                raise gr.Error(f"Error: {error}") from error
+
+            turn_count = len(formatted_script.splitlines())
+            log += f"📝 Formatted script with {turn_count} turns\n\n"
             log += "🔄 Processing with VibeVoice (streaming mode)...\n"
             
             # Check for stop signal before processing
@@ -785,7 +777,8 @@ def create_demo_interface(demo_instance: VibeVoiceDemo):
 Speaker 1: Welcome to our podcast today!
 Speaker 2: Thanks for having me. I'm excited to discuss...
 
-Or paste text directly and it will auto-assign speakers.""",
+Only an explicit Speaker N: label changes the voice. Unlabeled paragraphs
+continue with the current speaker, or Speaker 1 when no label is present.""",
                     lines=12,
                     max_lines=20,
                     elem_classes="script-input"
@@ -990,7 +983,7 @@ Or paste text directly and it will auto-assign speakers.""",
             else:
                 # Fallback to default
                 example_scripts = [
-                    [2, "Speaker 0: Welcome to our AI podcast demonstration!\nSpeaker 1: Thanks for having me. This is exciting!"]
+                    [2, "Speaker 1: Welcome to our AI podcast demonstration!\nSpeaker 2: Thanks for having me. This is exciting!"]
                 ]
             
             # Randomly select one
