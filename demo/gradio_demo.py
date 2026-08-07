@@ -214,7 +214,8 @@ class VibeVoiceDemo:
                                  cfg_scale: float = 1.3,
                                  inference_steps: Optional[int] = None,
                                  seed: Optional[int] = None,
-                                 disable_voice_cloning: bool = False) -> Iterator[tuple]:
+                                 disable_voice_cloning: bool = False,
+                                 stream_audio_during_generation: bool = False) -> Iterator[tuple]:
         try:
             
             # Reset stop flag and set generating state
@@ -369,20 +370,20 @@ class VibeVoiceDemo:
                 yield None, "🛑 Generation stopped by user", gr.update(visible=False)
                 return
 
-            # Collect audio chunks as they arrive
+            # Collect audio chunks internally. Do not publish partial audio to
+            # the browser; playback must begin only after generation completes.
             sample_rate = 24000
-            all_audio_chunks = []  # For final statistics
-            pending_chunks = []  # Buffer for accumulating small chunks
+            all_audio_chunks = []
+            pending_stream_chunks = []
+            total_audio_samples = 0
+            pending_stream_samples = 0
             chunk_count = 0
-            last_yield_time = time.time()
-            min_yield_interval = 15 # Yield every 15 seconds
-            min_chunk_size = sample_rate * 30 # At least 2 seconds of audio
+            last_status_time = time.time()
+            status_interval = 5
+            stream_chunk_target = sample_rate * 5
             
             # Get the stream for the first (and only) sample
             audio_stream = audio_streamer.get_stream(0)
-            
-            has_yielded_audio = False
-            has_received_chunks = False  # Track if we received any chunks at all
             
             for audio_chunk in audio_stream:
                 # Check for stop signal in the streaming loop
@@ -391,7 +392,6 @@ class VibeVoiceDemo:
                     break
                     
                 chunk_count += 1
-                has_received_chunks = True  # Mark that we received at least one chunk
                 
                 # Convert tensor to numpy
                 if torch.is_tensor(audio_chunk):
@@ -409,49 +409,47 @@ class VibeVoiceDemo:
                 # Convert to 16-bit for Gradio
                 audio_16bit = convert_to_16_bit_wav(audio_np)
                 
-                # Store for final statistics
+                # Buffer the audio until the stream is complete.
                 all_audio_chunks.append(audio_16bit)
-                
-                # Add to pending chunks buffer
-                pending_chunks.append(audio_16bit)
-                
-                # Calculate pending audio size
-                pending_audio_size = sum(len(chunk) for chunk in pending_chunks)
+                total_audio_samples += len(audio_16bit)
+                if stream_audio_during_generation:
+                    pending_stream_chunks.append(audio_16bit)
+                    pending_stream_samples += len(audio_16bit)
+
                 current_time = time.time()
-                time_since_last_yield = current_time - last_yield_time
-                
-                # Decide whether to yield
-                should_yield = False
-                if not has_yielded_audio and pending_audio_size >= min_chunk_size:
-                    # First yield: wait for minimum chunk size
-                    should_yield = True
-                    has_yielded_audio = True
-                elif has_yielded_audio and (pending_audio_size >= min_chunk_size or time_since_last_yield >= min_yield_interval):
-                    # Subsequent yields: either enough audio or enough time has passed
-                    should_yield = True
-                
-                if should_yield and pending_chunks:
-                    # Concatenate and yield only the new audio chunks
-                    new_audio = np.concatenate(pending_chunks)
-                    new_duration = len(new_audio) / sample_rate
-                    total_duration = sum(len(chunk) for chunk in all_audio_chunks) / sample_rate
-                    
-                    log_update = log + f"🎵 Streaming: {total_duration:.1f}s generated (chunk {chunk_count})\n"
-                    
-                    # Yield streaming audio chunk and keep complete_audio as None during streaming
-                    yield (sample_rate, new_audio), None, log_update, gr.update(visible=True)
-                    
-                    # Clear pending chunks after yielding
-                    pending_chunks = []
-                    last_yield_time = current_time
-            
-            # Yield any remaining chunks
-            if pending_chunks:
-                final_new_audio = np.concatenate(pending_chunks)
-                total_duration = sum(len(chunk) for chunk in all_audio_chunks) / sample_rate
-                log_update = log + f"🎵 Streaming final chunk: {total_duration:.1f}s total\n"
-                yield (sample_rate, final_new_audio), None, log_update, gr.update(visible=True)
-                has_yielded_audio = True  # Mark that we yielded audio
+                should_publish_stream = (
+                    stream_audio_during_generation
+                    and pending_stream_samples >= stream_chunk_target
+                )
+                should_publish_status = current_time - last_status_time >= status_interval
+
+                if should_publish_stream:
+                    streaming_audio = np.concatenate(pending_stream_chunks)
+                    total_duration = total_audio_samples / sample_rate
+                    log_update = log + (
+                        f"🎵 Playing while generating: {total_duration:.1f}s generated "
+                        f"(chunk {chunk_count})\n"
+                    )
+                    yield (sample_rate, streaming_audio), None, log_update, gr.update(visible=True)
+                    pending_stream_chunks = []
+                    pending_stream_samples = 0
+                    last_status_time = current_time
+                elif should_publish_status:
+                    total_duration = total_audio_samples / sample_rate
+                    mode_message = (
+                        "Playing while generating"
+                        if stream_audio_during_generation
+                        else "Buffering complete podcast"
+                    )
+                    log_update = log + f"🎵 {mode_message}: {total_duration:.1f}s generated (chunk {chunk_count})\n"
+                    yield None, None, log_update, gr.update(visible=True)
+                    last_status_time = current_time
+
+            if stream_audio_during_generation and pending_stream_chunks:
+                streaming_audio = np.concatenate(pending_stream_chunks)
+                total_duration = total_audio_samples / sample_rate
+                log_update = log + f"🎵 Playing final streamed segment: {total_duration:.1f}s generated\n"
+                yield (sample_rate, streaming_audio), None, log_update, gr.update(visible=True)
             
             # Wait for generation to complete (with timeout to prevent hanging)
             generation_thread.join(timeout=5.0)  # Increased timeout to 5 seconds
@@ -473,53 +471,22 @@ class VibeVoiceDemo:
                 yield None, None, "🛑 Generation stopped by user", gr.update(visible=False)
                 return
             
-            # Debug logging
-            # print(f"Debug: has_received_chunks={has_received_chunks}, chunk_count={chunk_count}, all_audio_chunks length={len(all_audio_chunks)}")
-            
-            # Check if we received any chunks but didn't yield audio
-            if has_received_chunks and not has_yielded_audio and all_audio_chunks:
-                # We have chunks but didn't meet the yield criteria, yield them now
-                complete_audio = np.concatenate(all_audio_chunks)
-                final_duration = len(complete_audio) / sample_rate
-                
-                final_log = log + f"⏱️ Generation completed in {generation_time:.2f} seconds\n"
-                final_log += f"🎵 Final audio duration: {final_duration:.2f} seconds\n"
-                final_log += f"📊 Total chunks: {chunk_count}\n"
-                final_log += "✨ Generation successful! Complete audio is ready.\n"
-                final_log += "💡 Not satisfied? You can regenerate or adjust the CFG scale for different results."
-                
-                # Yield the complete audio as a filepath so download uses our filename
-                complete_wav_path = _write_complete_wav(complete_audio, sample_rate=sample_rate)
-                yield None, complete_wav_path, final_log, gr.update(visible=False)
-                return
-            
-            if not has_received_chunks:
+            if not all_audio_chunks:
                 error_log = log + f"\n❌ Error: No audio chunks were received from the model. Generation time: {generation_time:.2f}s"
                 yield None, None, error_log, gr.update(visible=False)
                 return
-            
-            if not has_yielded_audio:
-                error_log = log + f"\n❌ Error: Audio was generated but not streamed. Chunk count: {chunk_count}"
-                yield None, None, error_log, gr.update(visible=False)
-                return
 
-            # Prepare the complete audio
-            if all_audio_chunks:
-                complete_audio = np.concatenate(all_audio_chunks)
-                final_duration = len(complete_audio) / sample_rate
-                
-                final_log = log + f"⏱️ Generation completed in {generation_time:.2f} seconds\n"
-                final_log += f"🎵 Final audio duration: {final_duration:.2f} seconds\n"
-                final_log += f"📊 Total chunks: {chunk_count}\n"
-                final_log += "✨ Generation successful! Complete audio is ready in the 'Complete Audio' tab.\n"
-                final_log += "💡 Not satisfied? You can regenerate or adjust the CFG scale for different results."
-                
-                # Final yield: Clear streaming audio and provide complete audio as filepath
-                complete_wav_path = _write_complete_wav(complete_audio, sample_rate=sample_rate)
-                yield None, complete_wav_path, final_log, gr.update(visible=False)
-            else:
-                final_log = log + "❌ No audio was generated."
-                yield None, None, final_log, gr.update(visible=False)
+            complete_audio = np.concatenate(all_audio_chunks)
+            final_duration = len(complete_audio) / sample_rate
+
+            final_log = log + f"⏱️ Generation completed in {generation_time:.2f} seconds\n"
+            final_log += f"🎵 Final audio duration: {final_duration:.2f} seconds\n"
+            final_log += f"📊 Total chunks: {chunk_count}\n"
+            final_log += "✨ Complete podcast is ready for playback and download.\n"
+            final_log += "💡 Not satisfied? You can regenerate or adjust the CFG scale for different results."
+
+            complete_wav_path = _write_complete_wav(complete_audio, sample_rate=sample_rate)
+            yield None, complete_wav_path, final_log, gr.update(visible=False)
 
         except gr.Error as e:
             # Handle Gradio-specific errors (like input validation)
@@ -713,7 +680,7 @@ def create_demo_interface(demo_instance: VibeVoiceDemo):
                     label="Number of Speakers",
                     elem_classes="slider-container"
                 )
-                
+
                 # Speaker selection
                 gr.Markdown("### 🎭 **Speaker Selection**")
                 
@@ -760,11 +727,18 @@ def create_demo_interface(demo_instance: VibeVoiceDemo):
                         precision=0,
                         label="Seed (-1 = random)",
                     )
-                    disable_voice_cloning = gr.Checkbox(
+                disable_voice_cloning = gr.Checkbox(
                         value=False,
                         label="Disable voice cloning (skip conditioning voice prompts)",
-                        info="When enabled, sets is_prefill=False so the model ignores provided speaker audio."
-                    )
+                    info="When enabled, sets is_prefill=False so the model ignores provided speaker audio."
+                )
+
+                playback_mode = gr.Radio(
+                    choices=["Wait for complete podcast", "Play while generating"],
+                    value="Wait for complete podcast",
+                    label="Playback Mode",
+                    info="Choose whether audio remains silent until complete or plays in segments while generating.",
+                )
                 
             # Right column - Generation
             with gr.Column(scale=2, elem_classes="generation-card"):
@@ -825,7 +799,7 @@ continue with the current speaker, or Speaker 1 when no label is present.""",
                                 font-size: 0.9rem;
                                 color: #166534;">
                         <span class="streaming-indicator"></span>
-                        <strong>LIVE STREAMING</strong> - Audio is being generated in real-time
+                        <strong>GENERATION IN PROGRESS</strong> - Using your selected playback mode
                     </div>
                     """,
                     visible=False,
@@ -835,15 +809,15 @@ continue with the current speaker, or Speaker 1 when no label is present.""",
                 # Output section
                 gr.Markdown("### 🎵 **Generated Podcast**")
                 
-                # Streaming audio output (outside of tabs for simpler handling)
+                # Hidden until streaming playback is selected and audio is ready.
                 audio_output = gr.Audio(
-                    label="Streaming Audio (Real-time)",
+                    label="Playing While Generating",
                     type="numpy",
                     elem_classes="audio-output",
-                    streaming=True,  # Enable streaming mode
+                    streaming=True,
                     autoplay=True,
-                    show_download_button=False,  # Explicitly show download button
-                    visible=True
+                    show_download_button=False,
+                    visible=False
                 )
                 
                 # Complete audio output (non-streaming)
@@ -858,8 +832,9 @@ continue with the current speaker, or Speaker 1 when no label is present.""",
                 )
                 
                 gr.Markdown("""
-                *💡 **Streaming**: Audio plays as it's being generated (may have slight pauses)  
-                *💡 **Complete Audio**: Will appear below after generation finishes*
+                *💡 **Wait for complete podcast** keeps playback silent until the finished file is ready.
+                **Play while generating** plays completed segments as they become available. Both modes
+                provide the same complete downloadable podcast after generation.*
                 """)
                 
                 # Generation log
@@ -882,9 +857,9 @@ continue with the current speaker, or Speaker 1 when no label is present.""",
             inputs=[num_speakers],
             outputs=speaker_selections
         )
-        
+
         # Main generation function with streaming
-        def generate_podcast_wrapper(num_speakers, script, speaker_1, speaker_2, speaker_3, speaker_4, cfg_scale, inference_steps, seed, disable_voice_cloning):
+        def generate_podcast_wrapper(num_speakers, script, speaker_1, speaker_2, speaker_3, speaker_4, cfg_scale, inference_steps, seed, disable_voice_cloning, playback_mode):
             """Wrapper function to handle the streaming generation call."""
             try:
                 speakers = [speaker_1, speaker_2, speaker_3, speaker_4]
@@ -905,7 +880,8 @@ continue with the current speaker, or Speaker 1 when no label is present.""",
                     cfg_scale=cfg_scale,
                     inference_steps=inference_steps,
                     seed=seed,
-                    disable_voice_cloning=disable_voice_cloning
+                    disable_voice_cloning=disable_voice_cloning,
+                    stream_audio_during_generation=(playback_mode == "Play while generating"),
                 ):
                     final_log = log
                     
@@ -914,11 +890,9 @@ continue with the current speaker, or Speaker 1 when no label is present.""",
                         # Final state: clear streaming, show complete audio
                         yield None, gr.update(value=complete_audio, visible=True), log, gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
                     else:
-                        # Streaming state: update streaming audio only
                         if streaming_audio is not None:
                             yield streaming_audio, gr.update(visible=False), log, streaming_visible, gr.update(visible=False), gr.update(visible=True)
                         else:
-                            # No new audio, just update status
                             yield None, gr.update(visible=False), log, streaming_visible, gr.update(visible=False), gr.update(visible=True)
 
             except Exception as e:
@@ -953,7 +927,7 @@ continue with the current speaker, or Speaker 1 when no label is present.""",
             queue=False
         ).then(
             fn=generate_podcast_wrapper,
-            inputs=[num_speakers, script_input] + speaker_selections + [cfg_scale, inference_steps, seed, disable_voice_cloning],
+            inputs=[num_speakers, script_input] + speaker_selections + [cfg_scale, inference_steps, seed, disable_voice_cloning, playback_mode],
             outputs=[audio_output, complete_audio_output, log_output, streaming_status, generate_btn, stop_btn],
             queue=True  # Enable Gradio's built-in queue
         )
@@ -1011,8 +985,9 @@ continue with the current speaker, or Speaker 1 when no label is present.""",
         ### 💡 **Usage Tips**
         
         - Click **🚀 Generate Podcast** to start audio generation
-        - **Live Streaming** tab shows audio as it's generated (may have slight pauses)
-        - **Complete Audio** tab provides the full, uninterrupted podcast after generation
+        - Choose **Wait for complete podcast** to keep playback silent until generation finishes
+        - Choose **Play while generating** to hear completed segments as they become available
+        - The complete podcast remains available for playback and download in either mode
         - During generation, you can click **🛑 Stop Generation** to interrupt the process
         - The streaming indicator shows real-time generation progress
         """)
@@ -1128,7 +1103,7 @@ def main():
     print(f"🚀 Launching demo on port {args.port}")
     print(f"📁 Model path: {args.model_path}")
     print(f"🎭 Available voices: {len(demo_instance.available_voices)}")
-    print(f"🔴 Streaming mode: ENABLED")
+    print("🔴 Playback modes: WAIT FOR COMPLETE / PLAY WHILE GENERATING")
     print(f"🔒 Session isolation: ENABLED")
     
     # Launch the interface
