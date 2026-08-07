@@ -64,7 +64,10 @@ class VibeVoiceDemo:
         self.processor = VibeVoiceProcessor.from_pretrained(self.model_path)
         # Decide dtype & attention
         if self.device == "mps":
-            load_dtype = torch.float32
+            # float16, not float32: fp32 doubles the 1.5B model to ~11 GB,
+            # which pushes 16 GB Apple Silicon machines into swap (measured
+            # 92 s/step on an M1 Pro vs ~5 it/s at fp16, clean output).
+            load_dtype = torch.float16
             attn_impl_primary = "sdpa"
         elif self.device == "cuda":
             load_dtype = torch.bfloat16
