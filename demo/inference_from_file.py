@@ -413,7 +413,13 @@ def main():
     print(f"Generation time: {generation_time:.2f} seconds")
     
     # Calculate audio duration and additional metrics
-    if outputs.speech_outputs and outputs.speech_outputs[0] is not None:
+    # set these up front so the summary print at the bottom doesn't crash
+    # with a NameError on a run where generation comes back empty
+    audio_duration = 0.0
+    rtf = float('inf')
+    got_audio = bool(outputs.speech_outputs and outputs.speech_outputs[0] is not None)
+
+    if got_audio:
         # Assuming 24kHz sample rate (common for speech synthesis)
         sample_rate = 24000
         audio_samples = outputs.speech_outputs[0].shape[-1] if len(outputs.speech_outputs[0].shape) > 0 else len(outputs.speech_outputs[0])
@@ -438,12 +444,15 @@ def main():
     txt_filename = os.path.splitext(os.path.basename(args.txt_path))[0]
     output_path = os.path.join(args.output_dir, f"{txt_filename}_generated.wav")
     os.makedirs(args.output_dir, exist_ok=True)
-    
-    processor.save_audio(
-        outputs.speech_outputs[0], # First (and only) batch item
-        output_path=output_path,
-    )
-    print(f"Saved output to {output_path}")
+
+    if got_audio:
+        processor.save_audio(
+            outputs.speech_outputs[0], # First (and only) batch item
+            output_path=output_path,
+        )
+        print(f"Saved output to {output_path}")
+    else:
+        print("Skipping save: no audio was generated")
     
     # Print summary
     print("\n" + "="*50)
