@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import warnings
 import random
+import re
 
 try:
     import librosa  # type: ignore
@@ -54,6 +55,12 @@ class VibeVoiceDataset:
         data: Dict[str, Any] = {}
         data["text"] = item[self.text_column]
         data["audio"] = item[self.audio_column]
+
+        # Fix speaker lines
+        if not re.search(r"^Speaker\s*\d+:\s*", data["text"], re.MULTILINE):
+            data["text"] = "\n".join(
+                [f"Speaker 0: {line.strip()}" for line in data["text"].splitlines() if line.strip()]
+            )
 
         user_provided_prompt = None
         if self.voice_prompts_column and self.voice_prompts_column in item:
