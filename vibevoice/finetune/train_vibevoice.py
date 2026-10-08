@@ -1,27 +1,66 @@
-# train_vibevoice_lora.py
 import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from unsloth import FastLanguageModel
+from unsloth.kernels import fast_cross_entropy_loss
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from datasets import load_dataset, DatasetDict, VerificationMode
+
 
 from transformers import (
     HfArgumentParser,
     Trainer,
     set_seed,
     TrainerCallback,
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoProcessor,
 )
-from transformers import TrainingArguments as HfTrainingArguments
 
+from transformers.models.auto.tokenization_auto import TOKENIZER_MAPPING
+from transformers.models.auto.processing_auto import PROCESSOR_MAPPING
+from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
+from transformers.models.qwen2.tokenization_qwen2 import Qwen2Tokenizer
+from transformers import TrainingArguments as HfTrainingArguments
 from peft import LoraConfig, get_peft_model, TaskType
 
 from vibevoice.modular.modeling_vibevoice import VibeVoiceForConditionalGeneration
-from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
+from vibevoice.modular.configuration_vibevoice import (
+    VibeVoiceConfig,
+    VibeVoiceAcousticTokenizerConfig,
+    VibeVoiceSemanticTokenizerConfig,
+    VibeVoiceDiffusionHeadConfig,
+)
+
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
+
+
+
+# Ensure push_to_hub are registered
+def _disable_processor_push_to_hub() -> None:
+    def _push_to_hub(cls, *args, **kwargs):
+        """Dummy method to disable push_to_hub."""
+        return ""
+
+    VibeVoiceProcessor.push_to_hub = classmethod(_push_to_hub)  # type: ignore[misc]
+
+_disable_processor_push_to_hub()
+# Register the custom VibeVoice configurations and model with transformers.
+AutoConfig.register("vibevoice", VibeVoiceConfig)
+AutoConfig.register("vibevoice_acoustic_tokenizer", VibeVoiceAcousticTokenizerConfig)
+AutoConfig.register("vibevoice_semantic_tokenizer", VibeVoiceSemanticTokenizerConfig)
+AutoConfig.register("vibevoice_diffusion_head", VibeVoiceDiffusionHeadConfig)
+AutoModelForCausalLM.register(VibeVoiceConfig, VibeVoiceForConditionalGeneration)
+
+# Register tokenizer mapping (VibeVoice uses Qwen2 tokenizer)
+TOKENIZER_MAPPING.register(VibeVoiceConfig, (Qwen2Tokenizer, Qwen2TokenizerFast))
+
+# Register processor mapping (VibeVoice uses VibeVoiceProcessor)
+PROCESSOR_MAPPING.register(VibeVoiceConfig, VibeVoiceProcessor)
 
 from vibevoice.finetune.data_vibevoice import VibeVoiceDataset, VibeVoiceCollator
 
@@ -260,15 +299,36 @@ def main() -> None:
     # Load model
     if model_args.model_name_or_path is None:
         raise ValueError("--model_name_or_path is required to load VibeVoice base model")
+    
+    logger.info(f"Loading model from: {model_args.model_name_or_path}")
+    
+    # Ensure registrations are active (sometimes they need to be re-registered)
+    logger.info("Re-registering VibeVoice configurations with transformers...")
+    AutoConfig.register("vibevoice", VibeVoiceConfig)
+    AutoConfig.register("vibevoice_acoustic_tokenizer", VibeVoiceAcousticTokenizerConfig)
+    AutoConfig.register("vibevoice_semantic_tokenizer", VibeVoiceSemanticTokenizerConfig)
+    AutoConfig.register("vibevoice_diffusion_head", VibeVoiceDiffusionHeadConfig)
+    AutoModelForCausalLM.register(VibeVoiceConfig, VibeVoiceForConditionalGeneration)
+    TOKENIZER_MAPPING.register(VibeVoiceConfig, (Qwen2Tokenizer, Qwen2TokenizerFast))
+    PROCESSOR_MAPPING.register(VibeVoiceConfig, VibeVoiceProcessor)
+    
     dtype = torch.float32
     if training_args.bf16:
         dtype = torch.bfloat16
     elif getattr(training_args, "fp16", False):
         dtype = torch.float16
-    model = VibeVoiceForConditionalGeneration.from_pretrained(
-        model_args.model_name_or_path,
-        torch_dtype=dtype,
+
+
+    model,tokenizer = FastLanguageModel.from_pretrained(
+            model_args.model_name_or_path,
+            auto_model=VibeVoiceForConditionalGeneration,
+            dtype=dtype,
+            whisper_language="none",
+            whisper_task="none",
+            use_gradient_checkpointing = "unsloth" if training_args.gradient_checkpointing else False,
+            load_in_4bit = False
     )
+
     _patch_acoustic_encode_for_legacy_indexing(model, logger)
     processor.semantic_tokenizer = getattr(model.model, "semantic_tokenizer", None)
 
@@ -350,13 +410,13 @@ def main() -> None:
         with torch.no_grad():
             simple_text = "The cat sat on the mat."
             simple_ids = torch.tensor([tok.encode(simple_text, add_special_tokens=True)], device=model.device)
-            simple_mask = torch.ones_like(simple_ids)
+            simple_mask = torch.ones_like(simple_ids, dtype=torch.bool)
             x = model.get_input_embeddings()(simple_ids)
             outputs = model.model(inputs_embeds=x, attention_mask=simple_mask, return_dict=True)
             logits = model.lm_head(outputs.last_hidden_state)
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = simple_ids[:, 1:].contiguous()
-            ce_loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), reduction='mean')
+            ce_loss = fast_cross_entropy_loss(shift_logits, shift_labels)
             logger.info(f"Simple text CE loss: {ce_loss.item():.4f}")
     except Exception as e:
         logger.warning(f"Tokenizer diagnostics failed: {e}")
@@ -629,7 +689,16 @@ def main() -> None:
             
             # --- START: Copy of model forward logic with new diffusion loss ---
             x = model.get_input_embeddings()(input_ids)
-
+            
+            x = x.clone()
+            if getattr(training_args, "bf16", False):
+                model_dtype = torch.bfloat16
+            elif getattr(training_args, "fp16", False):
+                model_dtype = torch.float16
+            else:
+                model_dtype = getattr(getattr(emb_module, "weight", None), "dtype", x.dtype)
+            if x.dtype != model_dtype:
+                x = x.to(dtype=model_dtype)
             semantic_speech_all_connect_features = model.model.semantic_connector(speech_semantic_tensors)
             if speeches_loss_input is not None:
                 # only part audio need diffuse
@@ -663,21 +732,40 @@ def main() -> None:
                 if speech_tensors is not None:
                     x[acoustic_input_mask] = speech_connect_features
 
-            outputs = model.model(
-                input_ids=None,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=x,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=False,
-                return_dict=return_dict,
-                cache_position=cache_position,
-            )
+
+            autocast_dtype = None
+            if model_dtype == torch.bfloat16:
+                autocast_dtype = torch.bfloat16
+            elif model_dtype == torch.float16:
+                autocast_dtype = torch.float16
+
+            def _forward_model():
+                return model.model(
+                    input_ids=None,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=x,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=False,
+                    return_dict=return_dict,
+                    cache_position=cache_position,
+                )
+
+            if autocast_dtype is not None and x.device.type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+                    outputs = _forward_model()
+            else:
+                outputs = _forward_model()
 
             hidden_states = outputs.last_hidden_state
             logits = model.lm_head(hidden_states)
+
+            if isinstance(speech_features, torch.Tensor) and speech_features.dtype != hidden_states.dtype:
+                speech_features = speech_features.to(dtype=hidden_states.dtype)
+            if isinstance(speech_connect_features, torch.Tensor) and speech_connect_features.dtype != hidden_states.dtype:
+                speech_connect_features = speech_connect_features.to(dtype=hidden_states.dtype)
 
             loss = None
 
@@ -815,8 +903,7 @@ def main() -> None:
             logits = outputs.logits
             ce_labels = mask_for_ce(labels, attention_mask, acoustic_input_mask, pad_id=-100)
             shift_logits = logits[:, :-1, :].contiguous()
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            ce_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), ce_labels.view(-1))
+            ce_loss = fast_cross_entropy_loss(shift_logits, ce_labels)
 
             # Optional CE diagnostics
             try:
@@ -989,11 +1076,6 @@ def main() -> None:
         except Exception as e:
             logger.warning(f"[debug_save] Unexpected failure saving initial components: {e}")
 
-    if getattr(training_args, "gradient_checkpointing", False):
-        try:
-            model.gradient_checkpointing_enable()
-        except Exception:
-            logger.warning("Failed to enable gradient checkpointing on the model.")
 
     if training_args.do_train:
         trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
