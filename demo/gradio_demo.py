@@ -3,6 +3,7 @@ VibeVoice Gradio Demo - High-Quality Dialogue Generation Interface with Streamin
 """
 
 import argparse
+import filecmp
 import json
 import os
 import sys
@@ -14,6 +15,7 @@ from datetime import datetime
 import threading
 import numpy as np
 import gradio as gr
+from gradio import route_utils, routes
 import librosa
 import soundfile as sf
 import torch
@@ -31,6 +33,16 @@ from transformers import set_seed
 
 logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
+
+
+def cache_uploaded_files(files, destinations):
+    for source, destination in zip(files, destinations):
+        if os.path.normcase(os.path.abspath(source)) == os.path.normcase(os.path.abspath(destination)):
+            continue
+        if os.path.isfile(destination) and filecmp.cmp(source, destination, shallow=False):
+            os.unlink(source)
+        else:
+            route_utils.move_uploaded_files_to_cache([source], [destination])
 
 
 class VibeVoiceDemo:
@@ -1119,6 +1131,10 @@ def parse_args():
 def main():
     """Main function to run the demo."""
     args = parse_args()
+
+    # shortcut: Gradio 5.50 can rewrite cached Windows uploads; remove after a verified upstream fix.
+    if os.name == "nt" and gr.__version__ == "5.50.0":
+        routes.move_uploaded_files_to_cache = cache_uploaded_files
     
     set_seed(42)  # Set a fixed seed for reproducibility
 
