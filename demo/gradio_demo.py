@@ -3,6 +3,7 @@ VibeVoice Gradio Demo - High-Quality Dialogue Generation Interface with Streamin
 """
 
 import argparse
+from contextlib import closing
 import json
 import os
 import sys
@@ -217,12 +218,15 @@ class VibeVoiceDemo:
                                  inference_steps: Optional[int] = None,
                                  seed: Optional[int] = None,
                                  disable_voice_cloning: bool = False) -> Iterator[tuple]:
+        generation_thread = None
+        audio_streamer = None
         try:
             
             # Reset stop flag and set generating state
             self.stop_generation = False
             self.is_generating = True
-            
+            yield None, None, "Starting generation…", gr.update(visible=False)
+
             # Validate inputs
             if not script.strip():
                 self.is_generating = False
@@ -285,7 +289,7 @@ class VibeVoiceDemo:
             # Check for stop signal
             if self.stop_generation:
                 self.is_generating = False
-                yield None, "🛑 Generation stopped by user", gr.update(visible=False)
+                yield None, None, "🛑 Generation stopped by user", gr.update(visible=False)
                 return
             
             # Load voice samples when voice cloning is enabled
@@ -305,7 +309,7 @@ class VibeVoiceDemo:
             # Check for stop signal
             if self.stop_generation:
                 self.is_generating = False
-                yield None, "🛑 Generation stopped by user", gr.update(visible=False)
+                yield None, None, "🛑 Generation stopped by user", gr.update(visible=False)
                 return
             
             # Parse script to assign speaker ID's
@@ -332,7 +336,7 @@ class VibeVoiceDemo:
             # Check for stop signal before processing
             if self.stop_generation:
                 self.is_generating = False
-                yield None, "🛑 Generation stopped by user", gr.update(visible=False)
+                yield None, None, "🛑 Generation stopped by user", gr.update(visible=False)
                 return
             
             start_time = time.time()
@@ -375,9 +379,8 @@ class VibeVoiceDemo:
             # Check for stop signal after thread start
             if self.stop_generation:
                 audio_streamer.end()
-                generation_thread.join(timeout=5.0)  # Wait up to 5 seconds for thread to finish
-                self.is_generating = False
-                yield None, "🛑 Generation stopped by user", gr.update(visible=False)
+                generation_thread.join()
+                yield None, None, "🛑 Generation stopped by user", gr.update(visible=False)
                 return
 
             # Collect audio chunks as they arrive
@@ -457,26 +460,15 @@ class VibeVoiceDemo:
                     last_yield_time = current_time
             
             # Yield any remaining chunks
-            if pending_chunks:
+            if pending_chunks and not self.stop_generation:
                 final_new_audio = np.concatenate(pending_chunks)
                 total_duration = sum(len(chunk) for chunk in all_audio_chunks) / sample_rate
                 log_update = log + f"🎵 Streaming final chunk: {total_duration:.1f}s total\n"
                 yield (sample_rate, final_new_audio), None, log_update, gr.update(visible=True)
                 has_yielded_audio = True  # Mark that we yielded audio
             
-            # Wait for generation to complete (with timeout to prevent hanging)
-            generation_thread.join(timeout=5.0)  # Increased timeout to 5 seconds
+            generation_thread.join()
 
-            # If thread is still alive after timeout, force end
-            if generation_thread.is_alive():
-                print("Warning: Generation thread did not complete within timeout")
-                audio_streamer.end()
-                generation_thread.join(timeout=5.0)
-
-            # Clean up
-            self.current_streamer = None
-            self.is_generating = False
-            
             generation_time = time.time() - start_time
             
             # Check if stopped by user
@@ -548,7 +540,15 @@ class VibeVoiceDemo:
             import traceback
             traceback.print_exc()
             yield None, None, error_msg, gr.update(visible=False)
-    
+        finally:
+            # Keep the queue occupied until the model thread has released its state.
+            if generation_thread is not None and generation_thread.is_alive():
+                self.stop_generation = True
+                audio_streamer.end()
+                generation_thread.join()
+            self.current_streamer = None
+            self.is_generating = False
+
     def _generate_with_streamer(
         self,
         inputs,
@@ -893,95 +893,80 @@ Or paste text directly and it will auto-assign speakers.""",
             outputs=speaker_selections
         )
         
-        # Main generation function with streaming
-        def generate_podcast_wrapper(num_speakers, script, speaker_1, speaker_2, speaker_3, speaker_4, cfg_scale, inference_steps, seed, disable_voice_cloning):
-            """Wrapper function to handle the streaming generation call."""
+        active_lock = threading.Lock()
+        active_session = None
+
+        def generate_podcast_wrapper(num_speakers, script, speaker_1, speaker_2, speaker_3, speaker_4,
+                                     cfg_scale, inference_steps, seed, disable_voice_cloning,
+                                     request: gr.Request = None):
+            nonlocal active_session
+            with active_lock:
+                busy = active_session is not None
+                if not busy:
+                    active_session = (getattr(request, "session_hash", None),)
+            if busy:
+                yield None, gr.skip(), "Generation is already running.", gr.skip(), gr.skip(), gr.skip()
+                return
+
+            completed = None
+            final_log = ""
+            first = True
             try:
-                speakers = [speaker_1, speaker_2, speaker_3, speaker_4]
-
-                # Clear outputs and reset visibility at start
-                yield None, gr.update(value=None, visible=False), "🎙️ Starting generation...", gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)
-
-                # The generator will yield multiple times
-                final_log = "Starting generation..."
-
-                for streaming_audio, complete_audio, log, streaming_visible in demo_instance.generate_podcast_streaming(
+                with closing(demo_instance.generate_podcast_streaming(
                     num_speakers=int(num_speakers),
                     script=script,
-                    speaker_1=speakers[0],
-                    speaker_2=speakers[1],
-                    speaker_3=speakers[2],
-                    speaker_4=speakers[3],
+                    speaker_1=speaker_1,
+                    speaker_2=speaker_2,
+                    speaker_3=speaker_3,
+                    speaker_4=speaker_4,
                     cfg_scale=cfg_scale,
                     inference_steps=inference_steps,
                     seed=seed,
-                    disable_voice_cloning=disable_voice_cloning
-                ):
-                    final_log = log
-                    
-                    # Check if we have complete audio (final yield)
-                    if complete_audio is not None:
-                        # Final state: clear streaming, show complete audio
-                        yield None, gr.update(value=complete_audio, visible=True), log, gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
-                    else:
-                        # Streaming state: update streaming audio only
-                        if streaming_audio is not None:
-                            yield streaming_audio, gr.update(visible=False), log, streaming_visible, gr.update(visible=False), gr.update(visible=True)
-                        else:
-                            # No new audio, just update status
-                            yield None, gr.update(visible=False), log, streaming_visible, gr.update(visible=False), gr.update(visible=True)
+                    disable_voice_cloning=disable_voice_cloning,
+                )) as generation:
+                    for live, complete, log, streaming_visible in generation:
+                        final_log = log
+                        if complete is not None:
+                            completed = complete
+                        elif not demo_instance.stop_generation:
+                            finished = gr.update(value=None, visible=False) if first else gr.skip()
+                            yield (live, finished, log, streaming_visible, gr.update(visible=False),
+                                   gr.update(visible=True) if first else gr.skip())
+                        first = False
+                if demo_instance.stop_generation:
+                    completed = None
+                    final_log = "🛑 Generation stopped by user"
+            except Exception as error:
+                completed = None
+                logger.exception('Generation callback failed')
+                final_log = f"❌ Generation failed: {error}"
+            finally:
+                with active_lock:
+                    active_session = None
 
-            except Exception as e:
-                error_msg = f"❌ A critical error occurred in the wrapper: {str(e)}"
-                print(error_msg)
-                import traceback
-                traceback.print_exc()
-                # Reset button states on error
-                yield None, gr.update(value=None, visible=False), error_msg, gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
-        
-        def stop_generation_handler():
-            """Handle stopping generation."""
-            demo_instance.stop_audio_generation()
-            # Return values for: log_output, streaming_status, generate_btn, stop_btn
-            return "🛑 Generation stopped.", gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
-        
-        # Add a clear audio function
-        def clear_audio_outputs():
-            """Clear both audio outputs before starting new generation."""
-            return None, gr.update(value=None, visible=False)
+            yield (None, gr.update(value=completed, visible=completed is not None), final_log,
+                   gr.update(visible=False), gr.update(visible=True), gr.update(visible=False))
 
-        # Connect generation button with streaming outputs
+        def stop_generation_handler(request: gr.Request = None):
+            session = getattr(request, "session_hash", None)
+            with active_lock:
+                if session and active_session == (session,) and not demo_instance.stop_generation:
+                    demo_instance.stop_audio_generation()
+
         generate_btn.click(
-            fn=clear_audio_outputs,
-            inputs=[],
-            outputs=[audio_output, complete_audio_output],
-            queue=False
-        ).then(  # Immediate UI update to hide Generate, show Stop (non-queued)
-            fn=lambda: (gr.update(visible=False), gr.update(visible=True)),
-            inputs=[],
-            outputs=[generate_btn, stop_btn],
-            queue=False
-        ).then(
             fn=generate_podcast_wrapper,
             inputs=[num_speakers, script_input] + speaker_selections + [cfg_scale, inference_steps, seed, disable_voice_cloning],
             outputs=[audio_output, complete_audio_output, log_output, streaming_status, generate_btn, stop_btn],
-            queue=True  # Enable Gradio's built-in queue
+            queue=True,
         )
-        
-        # Connect stop button
+
         stop_btn.click(
             fn=stop_generation_handler,
             inputs=[],
-            outputs=[log_output, streaming_status, generate_btn, stop_btn],
-            queue=False  # Don't queue stop requests
-        ).then(
-            # Clear both audio outputs after stopping
-            fn=lambda: (None, None),
-            inputs=[],
-            outputs=[audio_output, complete_audio_output],
-            queue=False
+            outputs=[],
+            queue=False,
         )
-        
+
         # Function to randomly select an example
         def load_random_example():
             """Randomly select and load an example script."""
