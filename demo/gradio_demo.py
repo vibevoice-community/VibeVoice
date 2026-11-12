@@ -933,7 +933,8 @@ Or paste text directly and it will auto-assign speakers.""",
                             yield (live, finished, log, streaming_visible, gr.update(visible=False),
                                    gr.update(visible=True) if first else gr.skip())
                         first = False
-                if demo_instance.stop_generation:
+                # The engine reports errors and stops; only discard a WAV if Stop arrived late.
+                if completed is not None and demo_instance.stop_generation:
                     completed = None
                     final_log = "🛑 Generation stopped by user"
             except Exception as error:

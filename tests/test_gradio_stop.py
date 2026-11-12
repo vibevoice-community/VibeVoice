@@ -4,6 +4,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from demo.gradio_demo import VibeVoiceDemo, create_demo_interface
 
 
@@ -79,6 +81,32 @@ class GradioStopTests(unittest.TestCase):
         self.assertIn("stopped", final[2])
         self.assertTrue(final[4]["visible"])
         self.assertIsNone(self.demo.current_streamer)
+
+    def test_worker_cleanup_preserves_the_streaming_error(self):
+        finished = threading.Event()
+        release = threading.Event()
+
+        def worker(_inputs, _cfg, streamer, *_args):
+            try:
+                streamer.put(torch.zeros((1, 8)), torch.tensor([0]))
+                for _ in range(100):
+                    if self.demo.stop_generation or release.wait(0.02):
+                        break
+            finally:
+                finished.set()
+
+        self.demo._generate_with_streamer = worker
+        try:
+            with patch("demo.gradio_demo.time.sleep"), patch(
+                "demo.gradio_demo.convert_to_16_bit_wav", side_effect=MemoryError("audio conversion failed")
+            ):
+                final = list(self.start())[-1]
+        finally:
+            release.set()
+        self.assertTrue(self.demo.stop_generation)
+        self.assertTrue(finished.is_set())
+        self.assertIn("audio conversion failed", final[2])
+        self.assertTrue(final[4]["visible"])
 
 
 if __name__ == "__main__":
